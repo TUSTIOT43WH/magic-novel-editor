@@ -2,17 +2,19 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-type View = 'books' | 'editor' | 'outline' | 'knowledge' | 'skills' | 'timeline' | 'relations' | 'settings';
+type View = 'books' | 'editor' | 'agents' | 'outline' | 'knowledge' | 'skills' | 'timeline' | 'relations' | 'settings';
 type Chapter = { id: number; no: number; title: string; status: '已入库' | '草稿' | '尚未开始'; time: string; location: string; content: string; words: number; summary?: string; summaryVersion?: number; summaryLocked?: boolean };
-type WorkspaceData = { book: { title: string; genre: string; systemPrompt: string; maxWords: number }; chapters: Chapter[]; outline: { title: string; summary: string; state: string }[]; knowledge: { type: string; title: string; body: string; tags: string[] }[]; skills: { title: string; description: string; enabled: boolean }[]; characters: { name: string; role: string; state: string; location: string; color?: string; marker?: string }[]; relations: { from: string; to: string; label: string; score: number }[]; timeline: { time: string; title: string; detail: string; chapter: number }[] };
+type WorkspaceData = { book: { title: string; genre: string; systemPrompt: string; maxWords: number }; chapters: Chapter[]; outline: { title: string; summary: string; state: string }[]; knowledge: { type: string; title: string; body: string; tags: string[] }[]; skills: { title: string; description: string; enabled: boolean }[]; characters: { name: string; role: string; state: string; location: string; color?: string; marker?: string }[]; relations: { from: string; to: string; label: string; score: number }[]; timeline: { time: string; title: string; detail: string; chapter: number; auto?: boolean }[] };
 type BookRecord = { id: string; data: WorkspaceData };
 type LibraryPayload = { libraryVersion: 1; activeBookId: string; books: BookRecord[] };
 type ModelConnection = { apiUrl: string; apiKey: string; model: string; enabled: boolean };
 type RecallItem = { id: string; source: 'knowledge' | 'character' | 'relation' | 'timeline' | 'chapter'; type: string; title: string; body: string; tags: string[]; score: number; reason: string; recommended: boolean };
 type DialogField = { key: string; label: string; value: string; placeholder?: string; multiline?: boolean };
 type DialogConfig = { title: string; description?: string; confirmText?: string; fields: DialogField[]; onSubmit: (values: Record<string, string>) => void };
+type AssistantMessage = { id: number; role: 'author' | 'assistant'; content: string; sources?: string[] };
 
 const MODEL_CONNECTION_STORAGE_KEY = 'mojing-local-model-connection-v1';
+const MAX_RECALL_ITEMS = 18;
 
 function isLocalModelHost() {
   if (typeof window === 'undefined') return false;
@@ -38,7 +40,7 @@ function blankBook(title: string, genre: string): WorkspaceData {
   };
 }
 
-const viewMeta: Record<View, [string, string]> = { books: ['我的书库', '创建、管理并随时切换不同作品'], editor: ['写作台', '章节正文与 Vibe 续写'], outline: ['全书大纲', '卷、主线与章节节拍'], knowledge: ['知识库', '世界观、地点、规则与伏笔'], skills: ['写作 Skills', '组合不同类型小说的写作方法'], timeline: ['故事时间线', '所有章节都可按时间点溯源'], relations: ['人物状态与关系', '入库后自动更新的故事状态'], settings: ['作品设置', '系统提示词与长篇上下文策略'] };
+const viewMeta: Record<View, [string, string]> = { books: ['我的书库', '创建、管理并随时切换不同作品'], editor: ['写作台', '章节正文与 Vibe 续写'], agents: ['并行智能体', '写作、全书审校与作者研究助手'], outline: ['全书大纲', '卷、主线与章节节拍'], knowledge: ['知识库', '世界观、地点、规则与伏笔'], skills: ['写作 Skills', '组合不同类型小说的写作方法'], timeline: ['故事时间线', '所有章节都可按时间点溯源'], relations: ['人物状态与关系', '入库后自动更新的故事状态'], settings: ['作品设置', '系统提示词与长篇上下文策略'] };
 
 const synonymGroups = [
   ['抵达', '进入', '到达', '前往'], ['异空间', '异常空间', '陌生空间', '迷宫空间'],
@@ -114,6 +116,21 @@ function summarizeChapterText(chapter: Chapter, characters: WorkspaceData['chara
   return [`时间：${time}`, `地点：${places.length ? places.join(' → ') : '未注明'}`, `主要角色：${roleText}`, `人物关系：${unique(relationTexts).join('；') || '作者尚未建立本章人物关系'}`, `关键事件：\n${safeEvents.map((item, index) => `${index + 1}. ${item}`).join('\n')}`, `章末状态：\n${endStates.length ? endStates.map((item) => `- ${item}`).join('\n') : '- 请作者在人物档案中补充'}`, `未解决事项：\n${unresolved.length ? unresolved.map((item) => `- ${item}`).join('\n') : '- 无明确记录'}`].join('\n').slice(0, 900);
 }
 
+function chapterRecallTitle(chapterNo: number, title: string) {
+  const prefix = `第 ${chapterNo} 章`;
+  const normalizedTitle = title.replace(/\s+/g, '');
+  return !normalizedTitle || normalizedTitle === `第${chapterNo}章` ? prefix : `${prefix} · ${title}`;
+}
+
+function splitChapterTime(value: string) {
+  const text = value.trim();
+  const chinese = text.match(/^(\d{4}年\s*\d{1,2}月\s*\d{1,2}日)(?:\s+(.+))?$/);
+  if (chinese) return { date: chinese[1], detail: chinese[2] || '' };
+  const iso = text.match(/^(\d{4}-\d{1,2}-\d{1,2})(?:[ T]+(.+))?$/);
+  if (iso) return { date: iso[1].replaceAll('-', ' · '), detail: iso[2] || '' };
+  return { date: text || '时间待补充', detail: '' };
+}
+
 function buildRecall(data: WorkspaceData, vibe: string, currentChapterNo: number): RecallItem[] {
   const knowledge = data.knowledge.map((item, index) => {
     const lexical = lexicalScore(vibe, item.title, item.body, item.tags);
@@ -130,8 +147,15 @@ function buildRecall(data: WorkspaceData, vibe: string, currentChapterNo: number
   const characters: RecallItem[] = mentioned.map((item, index) => ({ id: `character-${index}-${item.name}`, source: 'character', type: '人物状态', title: `${item.name} · ${item.role}`, body: `当前状态：${item.state}；当前位置：${item.location}；登场标记：${item.marker === 'retired' ? '不再登场' : '仍在故事中'}`, tags: ['强制召回'], score: 100, reason: '人物命中', recommended: true }));
   const names = new Set(mentioned.map((item) => item.name));
   const relations: RecallItem[] = data.relations.filter((item) => names.has(item.from) || names.has(item.to)).map((item, index) => ({ id: `relation-${index}-${item.from}-${item.to}`, source: 'relation', type: '人物关系', title: `${item.from} ↔ ${item.to}`, body: `关系：${item.label}；关系强度：${item.score}/100`, tags: ['强制召回'], score: 96, reason: '关系关联', recommended: true }));
-  const chapters: RecallItem[] = data.chapters.filter((item) => item.no < currentChapterNo && item.status === '已入库' && item.content.trim()).sort((a, b) => b.no - a.no).slice(0, 3).map((item, index) => ({ id: `chapter-${item.id}`, source: 'chapter', type: index === 0 ? '上一章正文摘要' : '前文章节摘要', title: `第 ${item.no} 章 · ${item.title}`, body: `${item.summaryVersion === 2 && item.summary ? item.summary : summarizeChapterText(item, data.characters, data.relations, data.knowledge)}\n章节结尾原文：${item.content.replace(/\s+/g, ' ').slice(-600)}`, tags: ['强制召回', '正文摘要', '连续性'], score: index === 0 ? 99 : 95 - index, reason: index === 0 ? '上章连续性' : '前文连续性', recommended: true }));
-  const timeline: RecallItem[] = [...data.timeline].sort((a, b) => b.time.localeCompare(a.time)).slice(0, 2).map((item) => ({ id: `timeline-${item.chapter}-${item.time}`, source: 'timeline', type: '近期时间线', title: `第 ${item.chapter} 章 · ${item.title}`, body: `${item.time}：${item.detail}`, tags: ['强制召回'], score: 92, reason: '近期剧情', recommended: true }));
+  const recentChapters = data.chapters.filter((item) => item.no < currentChapterNo && item.status === '已入库' && item.content.trim()).sort((a, b) => b.no - a.no).slice(0, 3);
+  const recalledChapterNos = new Set(recentChapters.map((item) => item.no));
+  const chapters: RecallItem[] = recentChapters.map((item, index) => ({ id: `chapter-${item.id}`, source: 'chapter', type: index === 0 ? '上一章正文摘要' : '前文章节摘要', title: chapterRecallTitle(item.no, item.title), body: `${item.summaryVersion === 2 && item.summary ? item.summary : summarizeChapterText(item, data.characters, data.relations, data.knowledge)}\n章节结尾原文：${item.content.replace(/\s+/g, ' ').slice(-600)}`, tags: ['强制召回', '正文摘要', '连续性'], score: index === 0 ? 99 : 95 - index, reason: index === 0 ? '上章连续性' : '前文连续性', recommended: true }));
+  const timeline: RecallItem[] = [...data.timeline].filter((item) => {
+    if (item.chapter >= currentChapterNo || recalledChapterNos.has(item.chapter) || item.auto) return false;
+    const sourceChapter = data.chapters.find((chapter) => chapter.no === item.chapter);
+    const sourceSummary = sourceChapter?.summaryVersion === 2 && sourceChapter.summary ? sourceChapter.summary : '';
+    return !sourceSummary || item.detail.replace(/\s+/g, '') !== sourceSummary.replace(/\s+/g, '');
+  }).sort((a, b) => b.time.localeCompare(a.time)).slice(0, 2).map((item) => ({ id: `timeline-${item.chapter}-${item.time}`, source: 'timeline', type: '近期时间线', title: chapterRecallTitle(item.chapter, item.title), body: `${item.time}：${item.detail}`, tags: ['强制召回'], score: 92, reason: '独立时间线事件', recommended: true }));
   return [...chapters, ...characters, ...relations, ...timeline, ...knowledge];
 }
 
@@ -139,11 +163,131 @@ function recallContext(items: RecallItem[]) {
   return items.map((item) => `【${item.type}｜${item.reason}】${item.title}：${item.body}`).join('\n');
 }
 
+function buildAuditChunks(data: WorkspaceData, maxChars = 24000) {
+  const chunks: string[] = [];
+  let current = '';
+  const push = (text: string) => {
+    if (current && current.length + text.length > maxChars) { chunks.push(current); current = ''; }
+    current += `${current ? '\n\n' : ''}${text}`;
+  };
+  data.chapters.filter((chapter) => chapter.content.trim()).sort((a, b) => a.no - b.no).forEach((chapter) => {
+    const header = `【第 ${chapter.no} 章｜${chapter.title}｜${chapter.time}｜${chapter.location}｜${chapter.status}】`;
+    const content = chapter.content.trim();
+    if (header.length + content.length <= maxChars) { push(`${header}\n${content}`); return; }
+    for (let start = 0, part = 1; start < content.length; start += maxChars - 240, part += 1) {
+      push(`${header}（正文分段 ${part}）\n${content.slice(start, start + maxChars - 240)}`);
+    }
+  });
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+async function requestAgentText(body: Record<string, unknown>, onContent?: (content: string) => void) {
+  const response = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const contentType = response.headers.get('content-type') || '';
+  if (!response.ok) {
+    const result = contentType.includes('application/json') ? await response.json() : { error: await response.text() };
+    const detail = typeof result.detail === 'string' && result.detail ? `：${result.detail}` : '';
+    throw new Error(`${result.error || '智能体请求失败'}${detail}`);
+  }
+  if (contentType.includes('application/json')) {
+    const result = await response.json() as { content?: string };
+    if (!result.content) throw new Error('模型没有返回内容');
+    onContent?.(result.content);
+    return result.content;
+  }
+  if (!response.body) throw new Error('浏览器无法读取模型响应');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let content = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    content += decoder.decode(value, { stream: true });
+    if (content) onContent?.(content);
+  }
+  content += decoder.decode();
+  if (!content.trim()) throw new Error('模型没有返回内容');
+  onContent?.(content);
+  return content;
+}
+
+function packAuditSections(sections: string[], maxChars = 22000) {
+  const chunks: string[] = [];
+  let current = '';
+  sections.forEach((section) => {
+    if (section.length > maxChars) {
+      if (current) { chunks.push(current); current = ''; }
+      for (let start = 0; start < section.length; start += maxChars) chunks.push(section.slice(start, start + maxChars));
+      return;
+    }
+    if (current && current.length + section.length + 2 > maxChars) { chunks.push(current); current = ''; }
+    current += `${current ? '\n\n' : ''}${section}`;
+  });
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function buildRecentChapterAudit(data: WorkspaceData, currentChapterNo: number, limit = 10) {
+  const chapters = data.chapters
+    .filter((item) => item.no < currentChapterNo && item.content.trim())
+    .sort((a, b) => a.no - b.no)
+    .slice(-limit);
+  const context = [
+    `【作品】${data.book.title}｜${data.book.genre}`,
+    `【校验范围】当前为第 ${currentChapterNo} 章；以下是它之前最近 ${chapters.length} 章的完整正文，不包含当前章节。`,
+    ...chapters.map((item) => `【第 ${item.no} 章｜${item.title}｜${item.time}｜${item.location}】\n${item.content.trim()}`),
+  ].join('\n\n');
+  return { chapters, context };
+}
+
+function buildUploadedTextChunks(text: string) {
+  const normalized = text.replace(/\r\n/g, '\n').trim();
+  return packAuditSections(normalized.split(/(?=^\s*第[零一二三四五六七八九十百千万\d]+章)/gm).filter((item) => item.trim()), 22000);
+}
+
+function citedChapterNumbers(report: string) {
+  return [...report.matchAll(/第\s*(\d+)\s*章/g)].map((match) => Number(match[1])).filter((value, index, values) => Number.isFinite(value) && values.indexOf(value) === index);
+}
+
+async function runAuditPipeline(chunks: string[], connection: ModelConnection | undefined, onProgress: (done: number, total: number, phase: string) => void) {
+  const reports = new Array<string>(chunks.length);
+  let cursor = 0; let done = 0;
+  const worker = async () => {
+    while (cursor < chunks.length) {
+      const index = cursor; cursor += 1;
+      reports[index] = await requestAgentText({ task: 'audit', systemPrompt: '你是长篇小说连贯性审校智能体。检查时间、地点、人物状态、人物关系、世界规则、因果链和伏笔，只报告有证据的问题；引用章节时统一使用“第 12 章”这样的阿拉伯数字格式。', context: chunks[index], connection });
+      done += 1; onProgress(done, chunks.length, '分批审校');
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, chunks.length) }, () => worker()));
+  let level = reports;
+  while (level.length > 1) {
+    onProgress(chunks.length, chunks.length, '交叉核对并合并');
+    const next: string[] = [];
+    for (let index = 0; index < level.length; index += 6) {
+      next.push(await requestAgentText({ task: 'audit', systemPrompt: '你是全书总审校编辑。合并以下审校报告，跨章节核对，删除重复与无证据猜测，保留严重程度、章节证据和修改建议。', context: level.slice(index, index + 6).map((item, offset) => `【子报告 ${index + offset + 1}】\n${item}`).join('\n\n'), connection }));
+    }
+    level = next;
+  }
+  return level[0];
+}
+
 export default function Home() {
   const [data, setData] = useState(seed); const [books, setBooks] = useState<BookRecord[]>([{ id: 'book-demo', data: seed }]); const [activeBookId, setActiveBookId] = useState('book-demo'); const [view, setView] = useState<View>('books'); const [chapterId, setChapterId] = useState(2); const [ai, setAi] = useState(true); const [vibe, setVibe] = useState(''); const [positive, setPositive] = useState(''); const [negative, setNegative] = useState(''); const [showPrompts, setShowPrompts] = useState(false); const [generating, setGenerating] = useState(false); const [pending, setPending] = useState(false); const [provider, setProvider] = useState(''); const [saved, setSaved] = useState('已保存'); const [toast, setToast] = useState(''); const hydrated = useRef(false);
   const [modelConnection, setModelConnection] = useState<ModelConnection>({ apiUrl: '', apiKey: '', model: '', enabled: false });
   const [recallOverrides, setRecallOverrides] = useState<Record<string, boolean>>({});
   const [homeDialog, setHomeDialog] = useState<DialogConfig | null>(null);
+  const [auditRunning, setAuditRunning] = useState(false);
+  const [auditProgress, setAuditProgress] = useState({ done: 0, total: 0, phase: '尚未开始' });
+  const [auditReport, setAuditReport] = useState('');
+  const [auditTarget, setAuditTarget] = useState('');
+  const [uploadedNovel, setUploadedNovel] = useState<{ name: string; text: string } | null>(null);
+  const [txtConfirmed, setTxtConfirmed] = useState(false);
+  const [assistantQuestion, setAssistantQuestion] = useState('');
+  const [assistantUseRag, setAssistantUseRag] = useState(true);
+  const [assistantRunning, setAssistantRunning] = useState(false);
+  const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
   const manuscriptRef = useRef<HTMLTextAreaElement | null>(null);
   const chapter = data.chapters.find((item) => item.id === chapterId) || data.chapters[0];
   useEffect(() => { fetch('/api/workspace').then((r) => r.json()).then((result) => {
@@ -175,11 +319,11 @@ export default function Home() {
   }, 650); return () => window.clearTimeout(timer); }, [data, books, activeBookId]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(''), 2400); return () => clearTimeout(timer); }, [toast]);
   const recallCandidates = useMemo(() => buildRecall(data, vibe, chapter.no), [data, vibe, chapter.no]);
-  const retrieved = useMemo(() => recallCandidates.filter((item) => recallOverrides[item.id] ?? item.recommended).slice(0, 12), [recallCandidates, recallOverrides]);
+  const retrieved = useMemo(() => recallCandidates.filter((item) => recallOverrides[item.id] ?? item.recommended).slice(0, MAX_RECALL_ITEMS), [recallCandidates, recallOverrides]);
   useEffect(() => { setRecallOverrides({}); }, [chapterId, activeBookId]);
   function toggleRecall(item: RecallItem) {
     const selected = recallOverrides[item.id] ?? item.recommended;
-    if (!selected && retrieved.length >= 12) { setToast('单次最多选择 12 条上下文'); return; }
+    if (!selected && retrieved.length >= MAX_RECALL_ITEMS) { setToast(`单次最多选择 ${MAX_RECALL_ITEMS} 条上下文`); return; }
     setRecallOverrides((old) => ({ ...old, [item.id]: !selected }));
   }
   const updateChapter = (patch: Partial<Chapter>) => setData((old) => ({ ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, ...patch } : item) }));
@@ -231,7 +375,79 @@ export default function Home() {
       setGenerating(false);
     }
   }
-  function ingest() { setData((old) => { const storedChapter = old.chapters.find((item) => item.id === chapter.id) || chapter; const generatedSummary = summarizeChapterText(storedChapter, old.characters, old.relations, old.knowledge); const summary = storedChapter.summaryLocked && storedChapter.summary ? storedChapter.summary : generatedSummary; const timelineEvent = { time: chapter.time, title: chapter.title, detail: summary, chapter: chapter.no }; return { ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, status: '已入库', words: item.content.replace(/\s/g, '').length, summary, summaryVersion: 2 } : item), timeline: old.timeline.some((item) => item.chapter === chapter.no) ? old.timeline.map((item) => item.chapter === chapter.no ? timelineEvent : item) : [...old.timeline, timelineEvent] }; }); setPending(false); setToast(chapter.summaryLocked ? '已入库：保留作者锁定的召回总结' : '已入库：已生成白名单召回总结，可在右侧编辑并锁定'); }
+  const agentConnection = modelConnection.enabled ? modelConnection : undefined;
+  const updateAuditProgress = (done: number, total: number, phase: string) => setAuditProgress({ done, total, phase });
+  async function startFastAudit() {
+    if (auditRunning) return;
+    const recent = buildRecentChapterAudit(data, chapter.no);
+    if (!recent.chapters.length) { setToast('当前章节之前还没有可校验的章节正文'); return; }
+    const firstNo = recent.chapters[0].no;
+    const lastNo = recent.chapters[recent.chapters.length - 1].no;
+    setAuditRunning(true); setAuditReport(''); setAuditTarget(`《${data.book.title}》第 ${firstNo}～${lastNo} 章全文校验`); updateAuditProgress(0, 1, '读取前十章全文');
+    let streamedReport = '';
+    try {
+      const report = await requestAgentText({ task: 'audit', systemPrompt: '你是长篇小说连贯性审校智能体。以下材料是当前章节之前最多十章的完整正文。请跨章节检查时间、地点、人物身份与状态、人物关系、世界规则、道具、因果链、信息揭示顺序、伏笔和前后矛盾。只报告有原文证据的问题，不要把合理留白当成错误；引用章节时统一使用“第 12 章”格式。', context: recent.context, connection: agentConnection }, (content) => {
+        streamedReport = content;
+        setAuditReport(content);
+        updateAuditProgress(0, 1, '模型正在生成报告');
+      });
+      setAuditReport(report); updateAuditProgress(1, 1, `第 ${firstNo}～${lastNo} 章全文校验完成`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '前十章全文校验失败';
+      setToast(message);
+      setAuditReport(streamedReport ? `${streamedReport}\n\n—— 校验连接提前中断，以上为已保留的报告内容。` : `校验未生成报告。\n\n错误信息：${message}`);
+      setAuditProgress((old) => ({ ...old, phase: streamedReport ? '连接中断，已保留部分报告' : '校验失败，请查看报告区' }));
+    }
+    finally { setAuditRunning(false); }
+  }
+  async function reviewAuditSuspects() {
+    if (auditRunning || !auditReport) return;
+    const chapterNumbers = citedChapterNumbers(auditReport);
+    const chapters = data.chapters.filter((item) => chapterNumbers.includes(item.no) && item.content.trim());
+    if (!chapters.length) { setToast('报告中没有识别到可复核的章节编号'); return; }
+    const chunks = buildAuditChunks({ ...data, chapters }).map((chunk) => `【快速审校报告】\n${auditReport}\n\n【仅复核报告点名章节的原文】\n${chunk}`);
+    setAuditRunning(true); setAuditTarget(`《${data.book.title}》疑点原文复核`); updateAuditProgress(0, chunks.length, '读取疑点章节原文');
+    try {
+      const report = await runAuditPipeline(chunks, agentConnection, updateAuditProgress);
+      setAuditReport(report); updateAuditProgress(chunks.length, chunks.length, `已复核第 ${chapterNumbers.join('、')} 章`);
+    } catch (error) { setToast(error instanceof Error ? error.message : '疑点复核失败'); setAuditProgress((old) => ({ ...old, phase: '复核中断' })); }
+    finally { setAuditRunning(false); }
+  }
+  async function chooseNovelTxt(file: File | null) {
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.txt')) { setToast('请选择 TXT 小说文件'); return; }
+    const text = await file.text();
+    if (!text.trim()) { setToast('TXT 文件没有可读取的正文'); return; }
+    setUploadedNovel({ name: file.name, text }); setTxtConfirmed(false);
+  }
+  async function startTxtDeepAudit() {
+    if (auditRunning || !uploadedNovel) return;
+    if (!txtConfirmed) { setToast('请先勾选高 Token 消耗确认'); return; }
+    const chunks = buildUploadedTextChunks(uploadedNovel.text);
+    if (!chunks.length) { setToast('TXT 文件没有可审校内容'); return; }
+    setAuditRunning(true); setAuditReport(''); setAuditTarget(`${uploadedNovel.name} 全文深读`); updateAuditProgress(0, chunks.length, '分批读取 TXT 全文');
+    try {
+      const report = await runAuditPipeline(chunks, agentConnection, updateAuditProgress);
+      setAuditReport(report); updateAuditProgress(chunks.length, chunks.length, 'TXT 全文审校完成');
+    } catch (error) { setToast(error instanceof Error ? error.message : 'TXT 深度审校失败'); setAuditProgress((old) => ({ ...old, phase: '深读中断' })); }
+    finally { setAuditRunning(false); }
+  }
+  async function askWritingAssistant() {
+    const question = assistantQuestion.trim();
+    if (!question || assistantRunning) return;
+    const messageId = Date.now();
+    setAssistantMessages((old) => [...old, { id: messageId, role: 'author', content: question }]); setAssistantQuestion(''); setAssistantRunning(true);
+    try {
+      const nextChapterNo = Math.max(1, ...data.chapters.map((item) => item.no)) + 1;
+      const ragItems = assistantUseRag ? buildRecall(data, question, nextChapterNo).filter((item) => item.recommended).slice(0, MAX_RECALL_ITEMS) : [];
+      const history = assistantMessages.slice(-6).map((item) => `${item.role === 'author' ? '作者' : '助手'}：${item.content}`).join('\n\n');
+      const answer = await requestAgentText({ task: 'assistant', vibe: question, systemPrompt: '你是小说作者的研究与创作助手。回答准确、清楚、可直接用于写作；不确定时明确说明，不得伪造史料或本书设定。', context: `${ragItems.length ? `【本书 RAG】\n${recallContext(ragItems)}` : '【本书 RAG】未启用或未命中'}${history ? `\n\n【近期对话】\n${history}` : ''}`, connection: agentConnection });
+      setAssistantMessages((old) => [...old, { id: messageId + 1, role: 'assistant', content: answer, sources: ragItems.map((item) => item.title) }]);
+    } catch (error) {
+      setAssistantMessages((old) => [...old, { id: messageId + 1, role: 'assistant', content: `回答失败：${error instanceof Error ? error.message : '模型服务异常'}` }]);
+    } finally { setAssistantRunning(false); }
+  }
+  function ingest() { setData((old) => { const storedChapter = old.chapters.find((item) => item.id === chapter.id) || chapter; const generatedSummary = summarizeChapterText(storedChapter, old.characters, old.relations, old.knowledge); const summary = storedChapter.summaryLocked && storedChapter.summary ? storedChapter.summary : generatedSummary; const timelineEvent = { time: chapter.time, title: chapter.title, detail: summary, chapter: chapter.no, auto: true }; return { ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, status: '已入库', words: item.content.replace(/\s/g, '').length, summary, summaryVersion: 2 } : item), timeline: old.timeline.some((item) => item.chapter === chapter.no) ? old.timeline.map((item) => item.chapter === chapter.no ? timelineEvent : item) : [...old.timeline, timelineEvent] }; }); setPending(false); setToast(chapter.summaryLocked ? '已入库：保留作者锁定的召回总结' : '已入库：已生成白名单召回总结，可在右侧编辑并锁定'); }
   function addChapter() { const no = data.chapters.length + 1; const next: Chapter = { id: Date.now(), no, title: `第 ${no} 章`, status: '尚未开始', time: chapter.time, location: chapter.location, content: '', words: 0 }; setData((old) => ({ ...old, chapters: [...old.chapters, next] })); setChapterId(next.id); setVibe(''); setPositive(''); setNegative(''); setShowPrompts(false); setView('editor'); setPending(false); }
   function deleteChapter(id: number) {
     if (data.chapters.length === 1) { setToast('一本书至少需要保留一个章节'); return; }
@@ -251,7 +467,7 @@ export default function Home() {
     setBooks(current); setActiveBookId(id); setData(target.data); setChapterId(target.data.chapters[0]?.id || 0); setVibe(''); setPositive(''); setNegative(''); setShowPrompts(false); setPending(false); setView('editor'); setToast('已切换到《' + target.data.book.title + '》');
   }
   function createBook() {
-    setHomeDialog({ title: '创建新书', description: '为新作品填写名称和类型。', confirmText: '创建并开始写作', fields: [{ key: 'title', label: '书名', value: '', placeholder: '例如：我的第一本小说' }, { key: 'genre', label: '小说类型', value: '未分类', placeholder: '例如：悬疑、玄幻、言情' }], onSubmit: (values) => {
+    setHomeDialog({ title: '创建新书', description: '为新作品填写名称和类型。', confirmText: '创建并开始写作', fields: [{ key: 'title', label: '书名', value: '', placeholder: '例如：我的长篇小说' }, { key: 'genre', label: '小说类型', value: '未分类', placeholder: '例如：悬疑、玄幻、言情' }], onSubmit: (values) => {
       const title = values.title.trim(); if (!title) { setToast('请填写书名'); return; }
       const next = blankBook(title, values.genre.trim() || '未分类'); const id = 'book-' + Date.now();
       setBooks([...syncedBooks(), { id, data: next }]); setActiveBookId(id); setData(next); setChapterId(next.chapters[0].id); setVibe(''); setPositive(''); setNegative(''); setShowPrompts(false); setView('editor'); setHomeDialog(null); setToast('《' + title + '》已创建');
@@ -264,9 +480,14 @@ export default function Home() {
     if (id === activeBookId) { const next = remaining[0]; setActiveBookId(next.id); setData(next.data); setChapterId(next.data.chapters[0]?.id || 0); }
     setToast('书籍已删除');
   }
-  return <main className="studio-shell">{toast && <div className="toast">✓ {toast}</div>}<aside className="rail"><button className="brand-mark brand-button" title="我的书库" onClick={() => setView('books')}>墨</button><NavIcon label="书库" icon="书" active={view === 'books'} onClick={() => setView('books')} /><NavIcon label="写作台" icon="✦" active={view === 'editor'} onClick={() => setView('editor')} /><NavIcon label="大纲" icon="⌘" active={view === 'outline'} onClick={() => setView('outline')} /><NavIcon label="知识库" icon="◇" active={view === 'knowledge'} onClick={() => setView('knowledge')} /><NavIcon label="人物关系" icon="◎" active={view === 'relations'} onClick={() => setView('relations')} /><NavIcon label="时间线" icon="◷" active={view === 'timeline'} onClick={() => setView('timeline')} /><NavIcon label="Skills" icon="S" active={view === 'skills'} onClick={() => setView('skills')} /><div className="rail-spacer" /><NavIcon label="设置" icon="⚙" active={view === 'settings'} onClick={() => setView('settings')} /></aside>
+  const writerAgentProps = {
+    auditRunning, auditProgress, auditReport, auditTarget, onFastAudit: startFastAudit, onReviewSuspects: reviewAuditSuspects,
+    assistantQuestion, onAssistantQuestion: setAssistantQuestion, assistantUseRag, onAssistantUseRag: setAssistantUseRag,
+    assistantRunning, assistantMessages, onAskAssistant: askWritingAssistant, onOpenFull: () => setView('agents' as View),
+  };
+  return <main className="studio-shell">{toast && <div className="toast">✓ {toast}</div>}<aside className="rail"><button className="brand-mark brand-button" title="我的书库" onClick={() => setView('books')}>墨</button><NavIcon label="书库" icon="书" active={view === 'books'} onClick={() => setView('books')} /><NavIcon label="写作台" icon="✦" active={view === 'editor'} onClick={() => setView('editor')} /><NavIcon label="并行智能体" icon="协" active={view === 'agents'} onClick={() => setView('agents')} /><NavIcon label="大纲" icon="⌘" active={view === 'outline'} onClick={() => setView('outline')} /><NavIcon label="知识库" icon="◇" active={view === 'knowledge'} onClick={() => setView('knowledge')} /><NavIcon label="人物关系" icon="◎" active={view === 'relations'} onClick={() => setView('relations')} /><NavIcon label="时间线" icon="◷" active={view === 'timeline'} onClick={() => setView('timeline')} /><NavIcon label="Skills" icon="S" active={view === 'skills'} onClick={() => setView('skills')} /><div className="rail-spacer" /><NavIcon label="设置" icon="⚙" active={view === 'settings'} onClick={() => setView('settings')} /></aside>
     <aside className="chapter-pane"><div className="book-row book-switcher"><div><span className="eyebrow">当前作品</span><strong>{data.book.title}</strong></div><select aria-label="切换书籍" value={activeBookId} onChange={(e) => switchBook(e.target.value)}>{books.map((item) => <option key={item.id} value={item.id}>{item.data.book.title}</option>)}</select></div><button className="new-chapter" onClick={addChapter}>＋ 新建章节</button><div className="pane-label"><span>全部章节</span><span>{data.chapters.length}</span></div><nav className="chapter-list">{data.chapters.map((item) => <div key={item.id} className={`chapter-item ${chapterId === item.id ? 'active' : ''} ${item.status === '已入库' ? 'done' : ''}`}><button className="chapter-select" onClick={() => { setChapterId(item.id); setView('editor'); setPending(false); }}><span className="chapter-no">{String(item.no).padStart(2, '0')}</span><span><b>{item.title}</b><small>{item.words ? `${item.words.toLocaleString()} 字 · ` : ''}{item.status}</small></span></button><button className="delete-chapter" title="删除章节" aria-label={`删除《${item.title}》`} onClick={() => deleteChapter(item.id)}>×</button></div>)}</nav><div className="context-meter"><div className="meter-head"><span>长篇上下文</span><b>{data.chapters.reduce((a, c) => a + c.words, 0).toLocaleString()} / 500 万字</b></div><div className="meter"><i style={{ width: `${Math.max(2, data.chapters.reduce((a, c) => a + c.words, 0) / 50000)}%` }} /></div><small>摘要、实体与时间线持续索引中</small></div></aside>
-    <section className="workspace"><header className="topbar"><div><span className="page-title">{viewMeta[view][0]}</span><span className="page-subtitle">{viewMeta[view][1]}</span></div><div className="top-actions"><span className="saved">● {saved}</span>{view === 'editor' && <><button className="secondary" onClick={() => setView('timeline')}>时间线</button><button className="primary" onClick={ingest}>入库并更新</button></>}</div></header>{view === 'editor' ? <><div className="editor-wrap"><article className="manuscript"><div className="chapter-kicker">CHAPTER {String(chapter.no).padStart(2, '0')} · {chapter.time} · {chapter.location}</div><input className="title-input" value={chapter.title} onChange={(e) => updateChapter({ title: e.target.value })} /><textarea ref={manuscriptRef} className="manuscript-input" value={chapter.content} placeholder="从这里开始写作……" onChange={(e) => updateChapter({ content: e.target.value, words: e.target.value.replace(/\s/g, '').length, status: '草稿' })} /></article></div>{pending && <div className="review-strip"><div><b>AI 草稿已生成</b><span>由 {provider} 生成 · 已写入编辑区，可继续修改</span></div><button className="secondary" onClick={() => setPending(false)}>继续修改</button><button className="primary" onClick={ingest}>直接入库</button></div>}<section className="vibe-dock"><div className="dock-head"><div><span className="spark">✦</span><strong>Vibe 续写</strong><small>{generating ? '模型正在逐字写入正文' : `已选择 ${retrieved.length} 条上下文`}</small></div><label className="ai-toggle"><input type="checkbox" checked={ai} onChange={(e) => setAi(e.target.checked)} /><span /> AI 助写</label></div><textarea aria-label="剧情意图" value={vibe} onChange={(e) => setVibe(e.target.value)} placeholder="输入本章希望发生的剧情……" />{showPrompts && <div className="prompt-grid"><label>正向提示<input value={positive} onChange={(e) => setPositive(e.target.value)} /></label><label>反向提示<input value={negative} onChange={(e) => setNegative(e.target.value)} /></label></div>}<div className="chips"><button onClick={() => setShowPrompts(!showPrompts)}>{showPrompts ? '收起提示词' : '＋ 正反提示词'}</button><span title={retrieved.map((x) => `${x.title}（${x.reason}）`).join('、')}>召回：{retrieved.slice(0, 4).map((x) => x.title).join('、') || '尚未选择'}{retrieved.length > 4 ? ` 等 ${retrieved.length} 条` : ''}</span><button className="generate" disabled={generating} onClick={generate}>{generating ? '正在逐字生成…' : ai ? '生成草稿' : '关闭 AI，手动写作'} <kbd>⌘ ↵</kbd></button></div></section></> : view === 'books' ? <BooksHome books={books.map((item) => item.id === activeBookId ? { ...item, data } : item)} activeBookId={activeBookId} onOpen={switchBook} onCreate={createBook} onDelete={deleteBook} /> : <Panel view={view} data={data} setData={setData} setToast={setToast} modelConnection={modelConnection} setModelConnection={setModelConnection} />}</section>{view === 'editor' && <Inspector chapter={chapter} candidates={recallCandidates} selectedIds={new Set(retrieved.map((item) => item.id))} onToggleRecall={toggleRecall} data={data} setData={setData} setToast={setToast} />}{homeDialog && <EditDialog config={homeDialog} onClose={() => setHomeDialog(null)} />}</main>;
+    <section className="workspace"><header className="topbar"><div><span className="page-title">{viewMeta[view][0]}</span><span className="page-subtitle">{viewMeta[view][1]}</span></div><div className="top-actions"><span className="saved">● {saved}</span>{view === 'editor' && <><button className="secondary" onClick={() => setView('timeline')}>时间线</button><button className="primary" onClick={ingest}>入库并更新</button></>}</div></header>{view === 'editor' ? <><div className="editor-wrap"><article className="manuscript"><div className="chapter-kicker">CHAPTER {String(chapter.no).padStart(2, '0')} · {chapter.time} · {chapter.location}</div><input className="title-input" value={chapter.title} onChange={(e) => updateChapter({ title: e.target.value })} /><textarea ref={manuscriptRef} className="manuscript-input" value={chapter.content} placeholder="从这里开始写作……" onChange={(e) => updateChapter({ content: e.target.value, words: e.target.value.replace(/\s/g, '').length, status: '草稿' })} /></article></div>{pending && <div className="review-strip"><div><b>AI 草稿已生成</b><span>由 {provider} 生成 · 已写入编辑区，可继续修改</span></div><button className="secondary" onClick={() => setPending(false)}>继续修改</button><button className="primary" onClick={ingest}>直接入库</button></div>}<section className="vibe-dock"><div className="dock-head"><div><span className="spark">✦</span><strong>Vibe 续写</strong><small>{generating ? '模型正在逐字写入正文' : `已选择 ${retrieved.length} 条上下文`}</small></div><label className="ai-toggle"><input type="checkbox" checked={ai} onChange={(e) => setAi(e.target.checked)} /><span /> AI 助写</label></div><textarea aria-label="剧情意图" value={vibe} onChange={(e) => setVibe(e.target.value)} placeholder="输入本章希望发生的剧情……" />{showPrompts && <div className="prompt-grid"><label>正向提示<input value={positive} onChange={(e) => setPositive(e.target.value)} /></label><label>反向提示<input value={negative} onChange={(e) => setNegative(e.target.value)} /></label></div>}<div className="chips"><button onClick={() => setShowPrompts(!showPrompts)}>{showPrompts ? '收起提示词' : '＋ 正反提示词'}</button><span title={retrieved.map((x) => `${x.title}（${x.reason}）`).join('、')}>召回：{retrieved.slice(0, 4).map((x) => x.title).join('、') || '尚未选择'}{retrieved.length > 4 ? ` 等 ${retrieved.length} 条` : ''}</span><button className="generate" disabled={generating} onClick={generate}>{generating ? '正在逐字生成…' : ai ? '生成草稿' : '关闭 AI，手动写作'} <kbd>⌘ ↵</kbd></button></div></section></> : view === 'agents' ? <AgentWorkspace writingRunning={generating} onOpenWriter={() => setView('editor')} auditRunning={auditRunning} auditProgress={auditProgress} auditReport={auditReport} auditTarget={auditTarget} onFastAudit={startFastAudit} onReviewSuspects={reviewAuditSuspects} uploadedNovel={uploadedNovel} txtConfirmed={txtConfirmed} onTxtConfirmed={setTxtConfirmed} onChooseTxt={chooseNovelTxt} onTxtAudit={startTxtDeepAudit} assistantQuestion={assistantQuestion} onAssistantQuestion={setAssistantQuestion} assistantUseRag={assistantUseRag} onAssistantUseRag={setAssistantUseRag} assistantRunning={assistantRunning} assistantMessages={assistantMessages} onAskAssistant={askWritingAssistant} /> : view === 'books' ? <BooksHome books={books.map((item) => item.id === activeBookId ? { ...item, data } : item)} activeBookId={activeBookId} onOpen={switchBook} onCreate={createBook} onDelete={deleteBook} /> : <Panel view={view} data={data} setData={setData} setToast={setToast} modelConnection={modelConnection} setModelConnection={setModelConnection} />}</section>{view === 'editor' && <Inspector chapter={chapter} candidates={recallCandidates} selectedIds={new Set(retrieved.map((item) => item.id))} onToggleRecall={toggleRecall} data={data} setData={setData} setToast={setToast} />}{view === 'editor' && <WriterAgentFloat {...writerAgentProps} />}{homeDialog && <EditDialog config={homeDialog} onClose={() => setHomeDialog(null)} />}</main>;
 }
 
 
@@ -280,11 +501,65 @@ function BooksHome({ books, activeBookId, onOpen, onCreate, onDelete }: { books:
   </div>;
 }
 
+function WriterAgentFloat({ auditRunning, auditProgress, auditReport, auditTarget, onFastAudit, onReviewSuspects, assistantQuestion, onAssistantQuestion, assistantUseRag, onAssistantUseRag, assistantRunning, assistantMessages, onAskAssistant, onOpenFull }: {
+  auditRunning: boolean; auditProgress: { done: number; total: number; phase: string }; auditReport: string; auditTarget: string; onFastAudit: () => void; onReviewSuspects: () => void;
+  assistantQuestion: string; onAssistantQuestion: (value: string) => void; assistantUseRag: boolean; onAssistantUseRag: (value: boolean) => void; assistantRunning: boolean; assistantMessages: AssistantMessage[]; onAskAssistant: () => void; onOpenFull: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<'audit' | 'assistant'>('audit');
+  if (!open) return <div className="writer-agent-launchers" aria-label="写作助手工具">
+    <button title="展开连贯性审校" onClick={() => { setTab('audit'); setOpen(true); }}><b>审</b><span>审校</span></button>
+    <button title="展开作者助手" onClick={() => { setTab('assistant'); setOpen(true); }}><b>问</b><span>助手</span></button>
+  </div>;
+  return <aside className="writer-agent-float" aria-label="写作悬浮助手">
+    <header><div><span>WRITING COPILOT</span><b>{tab === 'audit' ? '连贯性审校' : '作者助手'}</b></div><button className="float-close" title="收起悬浮助手" onClick={() => setOpen(false)}>×</button></header>
+    <nav><button className={tab === 'audit' ? 'active' : ''} onClick={() => setTab('audit')}>审校建议</button><button className={tab === 'assistant' ? 'active' : ''} onClick={() => setTab('assistant')}>提问助手</button></nav>
+    {tab === 'audit' ? <div className="float-audit">
+      <div className="float-action-row"><div><b>当前章节前十章</b><small>{auditRunning ? auditProgress.phase : auditTarget || '检查跨章时间、人物与因果'}</small></div><button className="primary" disabled={auditRunning} onClick={onFastAudit}>{auditRunning ? '校验中…' : '开始校验'}</button></div>
+      {(auditRunning || auditProgress.total > 0) && <div className="float-progress"><i><em style={{ width: `${auditProgress.total ? Math.min(100, auditProgress.done / auditProgress.total * 100) : 8}%` }} /></i><span>{auditProgress.phase}</span></div>}
+      <div className="float-report">{auditReport ? <pre>{auditReport}</pre> : <div><b>还没有审校建议</b><span>点击“开始校验”，报告会在这里边生成边显示。</span></div>}</div>
+      <button className="float-review" disabled={auditRunning || !auditReport} onClick={onReviewSuspects}>复核报告点名的疑点原文</button>
+    </div> : <div className="float-assistant">
+      <div className="float-chat">{assistantMessages.length ? assistantMessages.map((message) => <article className={message.role} key={message.id}><span>{message.role === 'author' ? '作者' : '助手'}</span><p>{message.content}</p>{message.sources && message.sources.length > 0 && <small>参考本书：{message.sources.join('、')}</small>}</article>) : <div className="float-chat-empty"><b>边写边问</b><span>可以询问历史资料、情节逻辑或本书已有设定。</span></div>}{assistantRunning && <div className="assistant-thinking">助手正在整理答案…</div>}</div>
+      <form className="float-compose" onSubmit={(event) => { event.preventDefault(); onAskAssistant(); }}><textarea value={assistantQuestion} onChange={(event) => onAssistantQuestion(event.target.value)} placeholder="输入想咨询的问题……" /><div><label className="rag-switch"><input type="checkbox" checked={assistantUseRag} onChange={(event) => onAssistantUseRag(event.target.checked)} /><i /><b>{assistantUseRag ? '本书 RAG' : '通用问答'}</b></label><button className="primary" disabled={assistantRunning || !assistantQuestion.trim()} type="submit">发送</button></div></form>
+    </div>}
+    <footer><button onClick={onOpenFull}>打开完整智能体工作台 →</button></footer>
+  </aside>;
+}
+
+function AgentWorkspace({ writingRunning, onOpenWriter, auditRunning, auditProgress, auditReport, auditTarget, onFastAudit, onReviewSuspects, uploadedNovel, txtConfirmed, onTxtConfirmed, onChooseTxt, onTxtAudit, assistantQuestion, onAssistantQuestion, assistantUseRag, onAssistantUseRag, assistantRunning, assistantMessages, onAskAssistant }: {
+  writingRunning: boolean; onOpenWriter: () => void; auditRunning: boolean; auditProgress: { done: number; total: number; phase: string }; auditReport: string; auditTarget: string; onFastAudit: () => void; onReviewSuspects: () => void; uploadedNovel: { name: string; text: string } | null; txtConfirmed: boolean; onTxtConfirmed: (value: boolean) => void; onChooseTxt: (file: File | null) => void; onTxtAudit: () => void; assistantQuestion: string; onAssistantQuestion: (value: string) => void; assistantUseRag: boolean; onAssistantUseRag: (value: boolean) => void; assistantRunning: boolean; assistantMessages: AssistantMessage[]; onAskAssistant: () => void;
+}) {
+  const txtChunks = uploadedNovel ? buildUploadedTextChunks(uploadedNovel.text).length : 0;
+  return <div className="content-page agents-page">
+    <section className="agent-status-grid">
+      <article><i>01</i><div><span>WRITER</span><h2>写作智能体</h2><p>流式续写当前章节，可与审校和助手同时工作。</p></div><b className={writingRunning ? 'running' : ''}>{writingRunning ? '写作中' : '待命'}</b><button className="secondary" onClick={onOpenWriter}>打开写作台</button></article>
+      <article><i>02</i><div><span>CONTINUITY</span><h2>连贯性审校</h2><p>校验当前章节之前最近十章的完整正文，检查跨章逻辑。</p></div><b className={auditRunning ? 'running' : ''}>{auditRunning ? auditProgress.phase : auditReport ? '已有报告' : '待命'}</b></article>
+      <article><i>03</i><div><span>RESEARCH</span><h2>作者助手</h2><p>通用研究问答，可选择外挂本书 RAG。</p></div><b className={assistantRunning ? 'running' : ''}>{assistantRunning ? '回答中' : '待命'}</b></article>
+    </section>
+    <div className="agent-work-grid">
+      <section className="audit-console">
+        <header><div><span>CONTINUITY REVIEW</span><h2>连贯性审校台</h2></div><button className="primary" disabled={auditRunning} onClick={onFastAudit}>{auditRunning ? '校验进行中…' : '校验前十章全文'}</button></header>
+        <div className="audit-mode"><div><b>前十章全文校验</b><p>以当前章节为基准，发送它之前最近十章的完整正文，不发送当前章节；只进行一次模型请求。</p></div><button className="secondary" disabled={auditRunning || !auditReport} onClick={onReviewSuspects}>复核报告中的疑点原文</button></div>
+        {(auditRunning || auditProgress.total > 0) && <div className="agent-progress"><div><span>{auditProgress.phase}</span><b>{auditProgress.done}/{auditProgress.total}</b></div><i><em style={{ width: `${auditProgress.total ? Math.min(100, auditProgress.done / auditProgress.total * 100) : 0}%` }} /></i></div>}
+        <div className="audit-report"><div><b>{auditTarget || '审校报告'}</b><small>{auditReport ? '模型生成的审校意见需要作者最终判断' : '完成前十章全文校验后，报告会显示在这里'}</small></div>{auditReport ? <pre>{auditReport}</pre> : <div className="agent-empty">尚无审校报告</div>}</div>
+        <div className="txt-audit"><header><div><span>HIGH TOKEN MODE</span><h3>上传 TXT 全书深读</h3></div><label className="file-button">选择 TXT<input type="file" accept=".txt,text/plain" onChange={(event) => onChooseTxt(event.target.files?.[0] || null)} /></label></header>{uploadedNovel ? <><p><b>{uploadedNovel.name}</b> · {uploadedNovel.text.length.toLocaleString()} 字符 · 预计 {txtChunks} 个正文批次，另有报告合并请求</p><label className="cost-confirm"><input type="checkbox" checked={txtConfirmed} onChange={(event) => onTxtConfirmed(event.target.checked)} />我了解全文会分批发送到自己配置的模型 API，并产生较高 Token 消耗</label><button className="danger-action" disabled={auditRunning || !txtConfirmed} onClick={onTxtAudit}>{auditRunning ? '审校任务运行中' : '开始 TXT 全文深读'}</button></> : <p>TXT 只在浏览器中读取；未点击开始深读前不会发送文件内容。</p>}</div>
+      </section>
+      <section className="assistant-console">
+        <header><div><span>AUTHOR ASSISTANT</span><h2>作者研究助手</h2></div><label className="rag-switch"><input type="checkbox" checked={assistantUseRag} onChange={(event) => onAssistantUseRag(event.target.checked)} /><i /><b>{assistantUseRag ? '本书 RAG 已开启' : '仅通用问答'}</b></label></header>
+        <div className="assistant-chat">{assistantMessages.length ? assistantMessages.map((message) => <article className={message.role} key={message.id}><span>{message.role === 'author' ? '作者' : '助手'}</span><p>{message.content}</p>{message.sources && message.sources.length > 0 && <small>参考本书：{message.sources.join('、')}</small>}</article>) : <div className="assistant-welcome"><b>可以问我创作和资料问题</b><p>例如：“唐朝有哪些年号？”、“这个角色此前在哪里受过伤？”</p><div><button onClick={() => onAssistantQuestion('唐朝有哪些年号？')}>唐朝年号</button><button onClick={() => onAssistantQuestion('检查当前主角的状态与最近剧情是否一致')}>主角状态</button></div></div>}{assistantRunning && <div className="assistant-thinking">助手正在整理答案…</div>}</div>
+        <form className="assistant-compose" onSubmit={(event) => { event.preventDefault(); onAskAssistant(); }}><textarea value={assistantQuestion} onChange={(event) => onAssistantQuestion(event.target.value)} placeholder={assistantUseRag ? '提问；将同时召回本书相关资料……' : '提问通用资料或创作问题……'} /><div><small>{assistantUseRag ? `最多发送 ${MAX_RECALL_ITEMS} 条命中的本书资料` : '不会发送本书 RAG 内容'}</small><button className="primary" disabled={assistantRunning || !assistantQuestion.trim()} type="submit">发送问题</button></div></form>
+      </section>
+    </div>
+  </div>;
+}
+
 function NavIcon({ label, icon, active, onClick }: { label: string; icon: string; active: boolean; onClick: () => void }) { return <button title={label} aria-label={label} className={`rail-button ${active ? 'active' : ''}`} onClick={onClick}>{icon}</button>; }
 function Inspector({ chapter, candidates, selectedIds, onToggleRecall, data, setData, setToast }: { chapter: Chapter; candidates: RecallItem[]; selectedIds: Set<string>; onToggleRecall: (item: RecallItem) => void; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void }) {
   const [tab, setTab] = useState<'context' | 'characters' | 'knowledge'>('context');
   const [dialog, setDialog] = useState<DialogConfig | null>(null);
   const primaryRelation = data.relations[0];
+  const timeDisplay = splitChapterTime(chapter.time);
   function editTime() {
     setDialog({ title: '编辑章节时间锚点', description: '修改后，本章入库事件将使用新的时间和地点。', confirmText: '保存修改', fields: [{ key: 'time', label: '章节时间', value: chapter.time, placeholder: 'YYYY-MM-DD HH:mm' }, { key: 'location', label: '章节地点', value: chapter.location }], onSubmit: (values) => {
       if (!values.time.trim()) { setToast('请填写章节时间'); return; }
@@ -312,7 +587,7 @@ function Inspector({ chapter, candidates, selectedIds, onToggleRecall, data, set
       <button className={tab === 'knowledge' ? 'active' : ''} onClick={() => setTab('knowledge')}>设定</button>
     </div>
     {tab === 'context' && <>
-      <section className="inspector-section"><div className="section-title"><span>本章时间锚点</span><button onClick={editTime}>编辑</button></div><div className="time-card"><b>{chapter.time.slice(0, 10).replaceAll('-', ' · ')}</b><span>{chapter.time.slice(11)} · {chapter.location}</span><small>所有事件将以此时间点入库</small></div></section>
+      <section className="inspector-section"><div className="section-title"><span>本章时间锚点</span><button onClick={editTime}>编辑</button></div><div className="time-card"><b>{timeDisplay.date}</b><span>{timeDisplay.detail ? `${timeDisplay.detail} · ` : ''}{chapter.location}</span><small>所有事件将以此时间点入库</small></div></section>
       <section className="inspector-section chapter-summary"><div className="section-title"><span>本章召回总结 · {chapter.summaryLocked ? '已锁定' : '可更新'}</span><button onClick={editSummary}>编辑</button></div><pre>{visibleSummary}</pre><div className="summary-actions"><button onClick={rebuildSummary}>按档案重建</button><button onClick={() => { setData((old) => ({ ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, summaryLocked: !item.summaryLocked, summary: item.summary || visibleSummary, summaryVersion: 2 } : item) })); setToast(chapter.summaryLocked ? '总结已解锁，下次入库可以更新' : '总结已锁定，入库不会覆盖'); }}>{chapter.summaryLocked ? '解除锁定' : '锁定当前版本'}</button></div></section>
       <section className="inspector-section"><div className="section-title"><span>召回候选 · 已选 {selectedIds.size}</span><button onClick={() => setToast('可按匹配度手动加入或移除')}>使用说明</button></div><div className="recall-options">{candidates.map((item) => { const selected = selectedIds.has(item.id); return <article className={`recall-option ${selected ? 'selected' : ''}`} key={item.id}><header><span>{item.type} · {item.reason}</span><strong>{item.score}%</strong></header><b>{item.title}</b><p>{item.body}</p><button onClick={() => onToggleRecall(item)}>{selected ? '移除本次召回' : '＋ 加入本次召回'}</button></article>; })}</div></section>
       <section className="inspector-section relation"><div className="section-title"><span>当前人物关系</span><button onClick={() => setToast(primaryRelation ? '已读取作者维护的人物关系' : '新书尚未建立人物关系')}>刷新</button></div>{primaryRelation ? <><div><span className="avatar">{primaryRelation.from.slice(0, 1)}</span><i>关系 {primaryRelation.score}</i><span className="avatar coral">{primaryRelation.to.slice(0, 1)}</span></div><p>{primaryRelation.from} · {primaryRelation.label} · {primaryRelation.to}</p></> : <div className="empty-recall">尚未建立人物关系。请前往人物关系页面手动添加人物和关系。</div>}</section>
@@ -333,6 +608,24 @@ function RelationGraph({ characters, relations, selectedName, onSelect }: { char
     {connected.length > 0 ? <div className="network-branches">{connected.map(({ relation, character }) => <article className="network-branch" key={`${relation.from}-${relation.to}`}><div className="network-link"><span>{relation.label}</span><i style={{ width: `${Math.max(12, relation.score)}%` }} /><small>关系强度 {relation.score}</small></div><button className={character.marker === 'retired' ? 'retired' : ''} onClick={() => onSelect(character.name)}><span style={{ background: character.color || defaultCharacterColor }}>{character.name[0]}</span><div><b>{character.name}</b><small>{character.role}</small><p>{character.state}</p></div><em>查看 →</em></button></article>)}</div> : <div className="network-empty">尚未建立与 {selected.name} 直接相关的关系</div>}
   </div><footer className="graph-profile"><span style={{ background: selected.color || defaultCharacterColor }}>{selected.name[0]}</span><div><b>{selected.name} · {selected.role}</b><p>{selected.state}</p><small>当前位置：{selected.location} · 标记：{selected.marker === 'retired' ? '不再登场' : '仍在故事中'}</small></div></footer></section>;
 }
+function ExpandableKnowledgeBody({ body }: { body: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const canExpand = body.trim().length > 120;
+
+  return <div className={`knowledge-body ${expanded ? 'expanded' : ''}`}>
+    <div className="knowledge-copy"><p>{body || '尚未填写详细内容。'}</p></div>
+    {canExpand && <button
+      type="button"
+      className="knowledge-expand"
+      aria-expanded={expanded}
+      onClick={() => setExpanded((value) => !value)}
+    >
+      <span>{expanded ? '收起' : '展开全部'}</span>
+      <i aria-hidden="true">⌄</i>
+    </button>}
+  </div>;
+}
+
 function Panel({ view, data, setData, setToast, modelConnection, setModelConnection }: { view: Exclude<View, 'editor'>; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void; modelConnection: ModelConnection; setModelConnection: React.Dispatch<React.SetStateAction<ModelConnection>> }) {
   const [selectedCharacter, setSelectedCharacter] = useState<string | null>(null);
   const [batchCharacters, setBatchCharacters] = useState<string[]>([]);
@@ -455,7 +748,7 @@ function Panel({ view, data, setData, setToast, modelConnection, setModelConnect
   const withDialog = (content: React.ReactNode) => <>{content}{dialog && <EditDialog config={dialog} onClose={() => setDialog(null)} />}</>;
 
   if (view === 'outline') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.outline.length} 卷 · 可新增、编辑和删除</p><button className="primary" onClick={addOutline}>＋ 新建卷</button></div><div className="outline-grid">{data.outline.map((item, i) => <article className="outline-card" key={i}><span>0{i + 1}</span><em>{item.state}</em><h2>{item.title}</h2><p>{item.summary}</p><footer className="card-actions"><button onClick={() => editOutline(item, i)}>编辑</button><button className="danger" onClick={() => remove('outline', i, item.title)}>删除</button></footer></article>)}</div></div>);
-  if (view === 'knowledge') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.knowledge.length} 条设定 · 可新增、编辑和删除</p><button className="primary" onClick={addKnowledge}>＋ 添加知识</button></div><div className="knowledge-grid">{data.knowledge.map((item, i) => <article className="knowledge-card" key={i}><div><span>{item.type}</span><button onClick={() => editKnowledge(item, i)}>编辑</button></div><h3>{item.title}</h3><p>{item.body}</p><footer>{item.tags.map((tag) => <i key={tag}>#{tag}</i>)}</footer><div className="card-actions"><button onClick={() => editKnowledge(item, i)}>编辑</button><button className="danger" onClick={() => remove('knowledge', i, item.title)}>删除</button></div></article>)}</div></div>);
+  if (view === 'knowledge') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.knowledge.length} 条设定 · 可新增、编辑和删除</p><button className="primary" onClick={addKnowledge}>＋ 添加知识</button></div><div className="knowledge-grid">{data.knowledge.map((item, i) => <article className="knowledge-card" key={i}><div><span>{item.type}</span><button onClick={() => editKnowledge(item, i)}>编辑</button></div><h3>{item.title}</h3><ExpandableKnowledgeBody body={item.body} /><footer>{item.tags.map((tag) => <i key={tag}>#{tag}</i>)}</footer><div className="card-actions"><button onClick={() => editKnowledge(item, i)}>编辑</button><button className="danger" onClick={() => remove('knowledge', i, item.title)}>删除</button></div></article>)}</div></div>);
   if (view === 'skills') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.skills.length} 个 Skills · 可配置内容</p><button className="primary" onClick={addSkill}>＋ 创建 Skill</button></div><div className="skills-list">{data.skills.map((item, index) => <article key={index}><div className="skill-icon">{item.title.slice(0, 1)}</div><button className="skill-edit" onClick={() => editSkill(item, index)}><h3>{item.title}</h3><p>{item.description}</p></button><label className="ai-toggle"><input type="checkbox" checked={item.enabled} onChange={(e) => setData((d) => ({ ...d, skills: d.skills.map((s, i) => i === index ? { ...s, enabled: e.target.checked } : s) }))} /><span /></label><button className="danger compact" onClick={() => remove('skills', index, item.title)}>删除</button></article>)}</div></div>);
   if (view === 'timeline') return withDialog(<div className="content-page timeline-page"><div className="timeline-summary"><b>故事时间：2019年7月17日</b><span>{data.timeline.length} 个事件锚点</span></div><div className="timeline-list">{[...data.timeline].sort((a, b) => a.time.localeCompare(b.time)).map((item) => <article key={`${item.time}-${item.title}`}><time>{item.time.slice(11)}<small>{item.time.slice(0, 10)}</small></time><i /><div><span>第 {item.chapter} 章</span><h3>{item.title}</h3><p>{item.detail}</p></div></article>)}</div></div>);
   if (view === 'relations') {
@@ -492,12 +785,20 @@ function ModelSettings({ value, onChange, setToast }: { value: ModelConnection; 
 
 function EditDialog({ config, onClose }: { config: DialogConfig; onClose: () => void }) {
   const [values, setValues] = useState<Record<string, string>>(() => Object.fromEntries(config.fields.map((field) => [field.key, field.value])));
+  const composing = useRef(false);
   useEffect(() => { setValues(Object.fromEntries(config.fields.map((field) => [field.key, field.value]))); }, [config]);
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', closeOnEscape); return () => window.removeEventListener('keydown', closeOnEscape);
   }, [onClose]);
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="edit-dialog" role="dialog" aria-modal="true" aria-label={config.title} onSubmit={(event) => { event.preventDefault(); config.onSubmit(values); }}><header><div><span>MOJING EDITOR</span><h2>{config.title}</h2>{config.description && <p>{config.description}</p>}</div><button type="button" aria-label="关闭弹窗" onClick={onClose}>×</button></header><div className="dialog-fields">{config.fields.map((field, index) => <label key={field.key}>{field.label}{field.multiline ? <textarea autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} /> : <input autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} />}</label>)}</div><footer><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">{config.confirmText || '保存'}</button></footer></form></div>;
+  const compositionProps = {
+    onCompositionStart: () => { composing.current = true; },
+    onCompositionEnd: () => { composing.current = false; },
+    onKeyDown: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      if (event.key === 'Enter' && (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)) event.preventDefault();
+    },
+  };
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="edit-dialog" role="dialog" aria-modal="true" aria-label={config.title} onSubmit={(event) => { event.preventDefault(); if (!composing.current) config.onSubmit(values); }}><header><div><span>MOJING EDITOR</span><h2>{config.title}</h2>{config.description && <p>{config.description}</p>}</div><button type="button" aria-label="关闭弹窗" onClick={onClose}>×</button></header><div className="dialog-fields">{config.fields.map((field, index) => <label key={field.key}>{field.label}{field.multiline ? <textarea {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} /> : <input {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} />}</label>)}</div><footer><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">{config.confirmText || '保存'}</button></footer></form></div>;
 }
 
 function PromptGuide() {

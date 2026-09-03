@@ -1,4 +1,5 @@
 type GenerateBody = {
+  task?: 'write' | 'audit' | 'assistant';
   vibe?: string;
   positive?: string;
   negative?: string;
@@ -71,15 +72,22 @@ export async function POST(request: Request) {
   } catch {
     return Response.json({ error: 'API 地址必须是有效的 http 或 https 地址' }, { status: 400 });
   }
-  const systemPrompt = body.systemPrompt || '你是一位严谨的中文长篇小说家。';
-  const userPrompt = `相关设定：\n${body.context || '无'}\n\n剧情意图：${body.vibe || ''}\n正向要求：${body.positive || '无'}\n避免：${body.negative || '无'}\n\n只输出小说正文。完整写完本次情节，不要停在半句话；接近输出限制时优先自然收束。`;
+  const task = body.task || 'write';
+  const systemPrompt = body.systemPrompt || (task === 'write' ? '你是一位严谨的中文长篇小说家。' : task === 'audit' ? '你是一位严谨的长篇小说连贯性审校编辑。' : '你是一位可靠的小说创作研究助手。');
+  const userPrompt = task === 'audit'
+    ? `请审校以下小说材料。重点检查：时间顺序、地点移动、人物身份与状态、人物关系、世界规则、道具、因果链、信息揭示顺序、伏笔回收和前后矛盾。只报告有文本证据的问题，不要把刻意留白当成错误。\n\n${body.context || '无材料'}\n\n按严重程度输出：严重冲突、疑似冲突、待作者确认、修改建议；引用章节编号和简短证据。`
+    : task === 'assistant'
+      ? `作者问题：${body.vibe || ''}\n\n可用参考资料：\n${body.context || '未启用或未命中本书 RAG'}\n\n直接回答作者问题。优先使用参考资料并说明依据；资料不足时明确区分确定事实、合理推测和需要进一步查证的内容。不要续写小说正文，除非作者明确要求示例。`
+      : `相关设定：\n${body.context || '无'}\n\n剧情意图：${body.vibe || ''}\n正向要求：${body.positive || '无'}\n避免：${body.negative || '无'}\n\n只输出小说正文。完整写完本次情节，不要停在半句话；接近输出限制时优先自然收束。`;
   const usesResponsesApi = new URL(apiUrl).pathname.replace(/\/+$/, '').endsWith('/responses');
+  const apiHostname = new URL(apiUrl).hostname.toLowerCase();
+  const isDeepSeekApi = apiHostname === 'api.deepseek.com' || apiHostname.endsWith('.deepseek.com');
   const response = await fetch(apiUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(usesResponsesApi
-      ? { model, instructions: systemPrompt, input: userPrompt, stream: true, max_output_tokens: 16384 }
-      : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], stream: true, max_tokens: 16384 }),
+      ? { model, instructions: systemPrompt, input: userPrompt, stream: true, max_output_tokens: task === 'write' ? 16384 : 6144 }
+      : { model, messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], stream: true, max_tokens: task === 'write' ? 16384 : 6144, ...(task === 'audit' && isDeepSeekApi ? { thinking: { type: 'disabled' } } : {}) }),
   });
   if (!response.ok) {
     const detail = await response.text();
@@ -91,7 +99,7 @@ export async function POST(request: Request) {
   if (contentType.includes('application/json') || !response.body) {
     const result = await response.json() as unknown;
     const content = usesResponsesApi ? responseText(result) : chatResponseText(result);
-    if (!content) return Response.json({ error: '模型完成了请求，但没有返回可解析的正文' }, { status: 502 });
+    if (!content) return Response.json({ error: '模型完成了请求，但没有返回可解析的内容' }, { status: 502 });
     return Response.json({ content, provider: model });
   }
 
