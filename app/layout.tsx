@@ -14,8 +14,9 @@ const geistMono = Geist_Mono({
 
 // 站点元信息：浏览器标题与搜索引擎描述。
 export const metadata: Metadata = {
-  title: '墨境 · AI 长篇小说编辑器',
+  title: '魔方ai故事创作平台',
   description: '支持 Vibe 驱动、设定召回、时间线溯源与人物状态更新的长篇小说编辑器。',
+  icons: { icon: '/favicon.svg' },
 };
 
 // 根布局：声明中文文档语言，把两种字体变量挂到 body 上供全局样式取用。
