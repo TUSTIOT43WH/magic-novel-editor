@@ -1,6 +1,6 @@
 'use client';
 
-// 魔方ai故事创作平台的单页主体：书库、写作台、并行智能体、大纲、知识库、人物关系、时间线、写作技能与作品设置都由这一个客户端组件驱动；
+// 魔方AI故事创作平台的单页主体：书库、写作台、并行智能体、大纲、知识库、人物关系、时间线、写作技能与作品设置都由这一个客户端组件驱动；
 // 作品数据保存在内存 data 中，并由 /api/workspace 防抖同步到服务端。
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { RailIcon, type RailIconName } from './components/rail-icons';
@@ -9,13 +9,18 @@ import type { AssistantStore } from './lib/assistant-types';
 import { detectStoryIntent } from './lib/assistant-tools';
 import { StoryImageInput } from './components/story-image-input';
 import { MAX_STORY_IMAGES, readStoryImage, type StoryImage } from './lib/story-images';
+import { WritingSkillInput } from './components/writing-skill-input';
+import { getWritingSkillId, importWritingSkillZip, prepareWritingSkills, type WritingSkill } from './lib/writing-skills';
+import { EmbeddingSettings, EMBEDDING_CONNECTION_STORAGE_KEY, emptyEmbeddingConnection, type EmbeddingSettingsValue } from './components/embedding-settings';
+import { useWritingEmbedding } from './components/use-writing-embedding';
+import { mergeEmbeddingRecall, writingEmbeddingDocuments, writingRecallContext, type RecallItem } from './lib/writing-recall';
 
 // 左侧导航可以切换的全部页面
 type View = 'books' | 'editor' | 'agents' | 'outline' | 'knowledge' | 'skills' | 'timeline' | 'relations' | 'settings';
 // 章节：正文与时间/地点锚点；summary 是入库时生成的召回总结，summaryLocked 表示不再被入库覆盖
 type Chapter = { id: number; no: number; title: string; status: '已入库' | '草稿' | '尚未开始'; time: string; location: string; content: string; words: number; summary?: string; summaryVersion?: number; summaryLocked?: boolean };
 // 单本作品的全部数据，也是持久化到服务端的完整内容
-type WorkspaceData = { assistant?: AssistantStore; book: { title: string; genre: string; systemPrompt: string; maxWords: number }; chapters: Chapter[]; outline: { title: string; summary: string; state: string }[]; knowledge: { type: string; title: string; body: string; tags: string[] }[]; skills: { title: string; description: string; enabled: boolean }[]; characters: { name: string; role: string; state: string; location: string; color?: string; marker?: string }[]; relations: { from: string; to: string; label: string; score: number }[]; timeline: { time: string; title: string; detail: string; chapter: number; auto?: boolean }[] };
+type WorkspaceData = { assistant?: AssistantStore; writingPreferences?: { selectedSkillIds?: string[]; embeddingEnabled?: boolean }; book: { title: string; genre: string; systemPrompt: string; maxWords: number }; chapters: Chapter[]; outline: { title: string; summary: string; state: string }[]; knowledge: { type: string; title: string; body: string; tags: string[] }[]; skills: WritingSkill[]; characters: { name: string; role: string; state: string; location: string; color?: string; marker?: string }[]; relations: { from: string; to: string; label: string; score: number }[]; timeline: { time: string; title: string; detail: string; chapter: number; auto?: boolean }[] };
 // 书库里的一本书（id 加作品数据）
 type BookRecord = { id: string; data: WorkspaceData };
 // 书库持久化负载：当前书 id 与全部书籍
@@ -23,7 +28,6 @@ type LibraryPayload = { libraryVersion: 1; activeBookId: string; books: BookReco
 // 作者自填的模型连接；未启用时后端回退到环境变量或配置提示
 type ModelConnection = { apiUrl: string; apiKey: string; model: string; enabled: boolean };
 // 一条召回候选：来源、正文片段、匹配分与命中原因
-type RecallItem = { id: string; source: 'knowledge' | 'character' | 'relation' | 'timeline' | 'chapter'; type: string; title: string; body: string; tags: string[]; score: number; reason: string; recommended: boolean };
 // 通用编辑弹窗里的单个字段
 type DialogField = { key: string; label: string; value: string; placeholder?: string; multiline?: boolean };
 // 通用编辑弹窗的完整配置：标题、字段与提交回调
@@ -35,6 +39,21 @@ type DialogConfig = { title: string; description?: string; confirmText?: string;
 const MODEL_CONNECTION_STORAGE_KEY = 'mojing-local-model-connection-v1';
 // 单次生成最多注入模型的召回条目数
 const MAX_RECALL_ITEMS = 18;
+
+// 本书写作风格预设；点击后填入系统提示词，作者仍可继续编辑。
+const WRITING_PROMPT_PRESETS = [
+  { label: "克制悬疑", prompt: "用冷静、克制的第三人称限知写作。减少解释，以感官细节和留白制造悬疑。" },
+  { label: "轻喜剧", prompt: "使用轻快、自然的对白推动情节，保持人物之间的化学反应与幽默感。" },
+  { label: "类型爽文", prompt: "采用节奏明快的类型文学写法，每章结尾设置强钩子。" },
+  { label: "玄幻", prompt: "以想象力充沛、画面清晰的中文创作玄幻故事。遵循本书既定的世界规则、力量体系和人物动机，让能力的使用伴随限制与代价。通过探索、冲突与人物选择推动成长，用具体细节展现奇异地域和文明，保持因果清晰、伏笔连贯。" },
+  { label: "修仙", prompt: "以沉浸、自然的中文创作修仙故事，兼顾求道心境、修行生活与人物之间的利益和情感。遵循本书已有的境界、功法、资源与宗门规则，通过积累、取舍和风险体现成长，让突破具有合理铺垫和代价。把斗法写清行动、限制与结果，保持人物实力和前文设定一致。" },
+  { label: "经典文学", prompt: "以凝练、自然且富有表现力的现代中文写作，重视人物处境、心理层次与社会环境。通过具体行动、日常细节和含蓄对话呈现人物的复杂性，让主题从情节和人物选择中自然生长。保持叙事视角、时代语境与已有设定一致，使人物转变有充分铺垫，情感表达含蓄而有力量。" },
+];
+
+// 为旧版技能补上固定标识，之后编辑或删除其他技能不会改变本次选择。
+function withWritingSkillIds(workspace: WorkspaceData): WorkspaceData {
+  return { ...workspace, skills: workspace.skills.map((skill, index) => ({ ...skill, id: getWritingSkillId(skill, index) })) };
+}
 
 // 只有本机（localhost）访问时才允许把模型连接写入浏览器存储
 function isLocalModelHost() {
@@ -65,7 +84,7 @@ function blankBook(title: string, genre: string): WorkspaceData {
 }
 
 // 每个页面的标题与副标题
-const viewMeta: Record<View, [string, string]> = { books: ['我的书库', '创建、管理并随时切换不同作品'], editor: ['写作台', '章节正文与 Vibe 续写'], agents: ['并行智能体', '写作、全书审校与作者研究助手'], outline: ['全书大纲', '卷、主线与章节节拍'], knowledge: ['知识库', '世界观、地点、规则与伏笔'], skills: ['写作 Skills', '组合不同类型小说的写作方法'], timeline: ['故事时间线', '所有章节都可按时间点溯源'], relations: ['人物状态与关系', '入库后自动更新的故事状态'], settings: ['作品设置', '系统提示词与长篇上下文策略'] };
+const viewMeta: Record<View, [string, string]> = { books: ['我的作品', '创建、管理并随时切换不同作品'], editor: ['写作台', '章节正文与 Vibe 续写'], agents: ['并行智能体', '写作、全书审校与作者研究助手'], outline: ['全书大纲', '卷、主线与章节节拍'], knowledge: ['知识库', '世界观、地点、规则与伏笔'], skills: ['写作 Skills', '组合不同类型小说的写作方法'], timeline: ['故事时间线', '所有章节都可按时间点溯源'], relations: ['人物状态与关系', '入库后自动更新的故事状态'], settings: ['作品设置', '系统提示词与长篇上下文策略'] };
 
 // 本地检索用的同义词组，把作者口语化的提问扩展到设定用词
 const synonymGroups = [
@@ -170,7 +189,7 @@ function buildRecall(data: WorkspaceData, vibe: string, currentChapterNo: number
     const lexical = lexicalScore(vibe, item.title, item.body, item.tags);
     const vector = cosineTextSimilarity(vibe, `${item.title} ${item.tags.join(' ')} ${item.body}`);
     const score = Math.min(99, Math.round(vector * 65 + Math.min(34, lexical)));
-    return { id: `knowledge-${index}`, source: 'knowledge' as const, type: item.type, title: item.title, body: item.body, tags: item.tags, score, reason: vector > 0.16 ? '文本＋向量' : score > 0 ? '关键词匹配' : '未自动命中', recommended: score >= 8 };
+    return { id: `knowledge-${index}`, source: 'knowledge' as const, type: item.type, title: item.title, body: item.body, tags: item.tags, score, reason: vector > 0.16 ? '词频＋关键词' : score > 0 ? '关键词匹配' : '未自动命中', recommended: score >= 8 };
   }).sort((a, b) => b.score - a.score);
   let autoKnowledgeCount = 0;
   knowledge.forEach((item) => {
@@ -222,7 +241,7 @@ async function requestAgentText(body: Record<string, unknown>, onContent?: (cont
   const response = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const contentType = response.headers.get('content-type') || '';
   if (!response.ok) {
-    const result = contentType.includes('application/json') ? await response.json() : { error: await response.text() };
+    const result = (contentType.includes('application/json') ? await response.json() : { error: await response.text() }) as { error?: string; detail?: string };
     const detail = typeof result.detail === 'string' && result.detail ? `：${result.detail}` : '';
     throw new Error(`${result.error || '智能体请求失败'}${detail}`);
   }
@@ -317,9 +336,12 @@ async function runAuditPipeline(chunks: string[], connection: ModelConnection | 
 // 应用根组件：持有全部作品状态，并承载持久化、召回、生成与三类智能体的流程
 export default function Home() {
   // 核心状态：当前作品、书库列表、当前章节与写作台输入
-  const [data, setData] = useState(seed); const [books, setBooks] = useState<BookRecord[]>([{ id: 'book-demo', data: seed }]); const [activeBookId, setActiveBookId] = useState('book-demo'); const [view, setView] = useState<View>('books'); const [chapterId, setChapterId] = useState(2); const [ai, setAi] = useState(true); const [vibe, setVibe] = useState(''); const [positive, setPositive] = useState(''); const [negative, setNegative] = useState(''); const [showPrompts, setShowPrompts] = useState(false); const [generating, setGenerating] = useState(false); const [pending, setPending] = useState(false); const [provider, setProvider] = useState(''); const [saved, setSaved] = useState('已保存'); const [toast, setToast] = useState(''); const hydrated = useRef(false);
+  const [data, setData] = useState(() => withWritingSkillIds(seed)); const [books, setBooks] = useState<BookRecord[]>([{ id: 'book-demo', data: withWritingSkillIds(seed) }]); const [activeBookId, setActiveBookId] = useState('book-demo'); const [view, setView] = useState<View>('books'); const [chapterId, setChapterId] = useState(2); const [ai, setAi] = useState(true); const [vibe, setVibe] = useState(''); const [positive, setPositive] = useState(''); const [negative, setNegative] = useState(''); const [showPrompts, setShowPrompts] = useState(false); const [generating, setGenerating] = useState(false); const [pending, setPending] = useState(false); const [provider, setProvider] = useState(''); const [saved, setSaved] = useState('已保存'); const [toast, setToast] = useState(''); const hydrated = useRef(false);
   // 模型连接、召回勾选、审校与提问助手等状态
   const [modelConnection, setModelConnection] = useState<ModelConnection>({ apiUrl: '', apiKey: '', model: '', enabled: false });
+  const [embeddingConnection, setEmbeddingConnection] = useState<EmbeddingSettingsValue>(emptyEmbeddingConnection);
+  const writingScope = useRef('');
+  const generationLock = useRef(false);
   const [recallOverrides, setRecallOverrides] = useState<Record<string, boolean>>({});
   const [homeDialog, setHomeDialog] = useState<DialogConfig | null>(null);
   const [auditRunning, setAuditRunning] = useState(false);
@@ -348,6 +370,14 @@ export default function Home() {
   const chapter = data.chapters.find((item) => item.id === chapterId) || data.chapters[0];
   const imageDraftKey = activeBookId + ':' + chapter.id;
   const storyImages = imageDrafts[imageDraftKey] || [];
+  useEffect(() => { writingScope.current = imageDraftKey; }, [imageDraftKey]);
+  const embeddingEnabled = data.writingPreferences?.embeddingEnabled || false;
+  const selectedSkillIds = data.writingPreferences?.selectedSkillIds || [];
+  const embeddingDocuments = useMemo(() => writingEmbeddingDocuments({ knowledge: data.knowledge, chapters: data.chapters }, chapter.no), [data.knowledge, data.chapters, chapter.no]);
+  const embedding = useWritingEmbedding({ bookId: activeBookId, chapterId: chapter.id, query: vibe, documents: embeddingDocuments, connection: embeddingConnection, enabled: embeddingEnabled });
+  function changeWritingPreferences(patch: NonNullable<WorkspaceData['writingPreferences']>) {
+    setData((old) => ({ ...old, writingPreferences: { ...old.writingPreferences, ...patch } }));
+  }
   // 读取并校验作者上传的参考图（张数、大小与格式由 lib/story-images 约束）
   async function addStoryImages(files: File[]) {
     if (imageReadLock.current || generating) return;
@@ -378,12 +408,14 @@ export default function Home() {
   }
   // 挂载时从服务端读取书库；读不到时保留空白作品
   useEffect(() => { fetch('/api/workspace').then((r) => r.json()).then((result) => {
-    const payload = result.payload as LibraryPayload | WorkspaceData | null;
+    const payload = (result as { payload?: LibraryPayload | WorkspaceData | null }).payload;
     if (payload && 'libraryVersion' in payload && payload.books.length) {
-      const active = payload.books.find((item) => item.id === payload.activeBookId) || payload.books[0];
-      setBooks(payload.books); setActiveBookId(active.id); setData(active.data); setChapterId(active.data.chapters[0]?.id || 0);
+      const loadedBooks = payload.books.map((item) => ({ ...item, data: withWritingSkillIds(item.data) }));
+      const active = loadedBooks.find((item) => item.id === payload.activeBookId) || loadedBooks[0];
+      setBooks(loadedBooks); setActiveBookId(active.id); setData(active.data); setChapterId(active.data.chapters[0]?.id || 0);
     } else if (payload && 'book' in payload && Array.isArray(payload.chapters)) {
-      setData(payload); setBooks([{ id: 'book-demo', data: payload }]); setActiveBookId('book-demo'); setChapterId(payload.chapters[0]?.id || 0);
+      const migrated = withWritingSkillIds(payload);
+      setData(migrated); setBooks([{ id: 'book-demo', data: migrated }]); setActiveBookId('book-demo'); setChapterId(migrated.chapters[0]?.id || 0);
     }
     hydrated.current = true;
   }).catch(() => { hydrated.current = true; }); }, []);
@@ -401,6 +433,16 @@ export default function Home() {
       window.localStorage.removeItem(MODEL_CONNECTION_STORAGE_KEY);
     }
   }, []);
+  // 向量模型凭据独立保存，仅本机访问时恢复；不放进书库持久化负载。
+  useEffect(() => {
+    if (!isLocalModelHost()) return;
+    try {
+      const stored = localStorage.getItem(EMBEDDING_CONNECTION_STORAGE_KEY);
+      if (!stored) return;
+      const value = JSON.parse(stored) as Partial<EmbeddingSettingsValue>;
+      if (typeof value.apiUrl === 'string' && typeof value.apiKey === 'string' && typeof value.model === 'string') setEmbeddingConnection({ apiUrl: value.apiUrl, apiKey: value.apiKey, model: value.model, enabled: true });
+    } catch { localStorage.removeItem(EMBEDDING_CONNECTION_STORAGE_KEY); }
+  }, []);
   // 作品数据变化后防抖 650ms 整库保存到服务端，失败时标记为离线草稿
   useEffect(() => { if (!hydrated.current) return; setSaved('保存中…'); const timer = window.setTimeout(() => {
     const payload: LibraryPayload = { libraryVersion: 1, activeBookId, books: books.map((item) => item.id === activeBookId ? { ...item, data } : item) };
@@ -411,9 +453,11 @@ export default function Home() {
   // 召回候选项：正文、Vibe 或章节变化时重算
   // 助手每次流式增量只改 assistant，不应触发全书召回重算。
   const recallData = useMemo(() => ({ book: data.book, chapters: data.chapters, outline: data.outline, knowledge: data.knowledge, skills: data.skills, characters: data.characters, relations: data.relations, timeline: data.timeline }), [data.book, data.chapters, data.outline, data.knowledge, data.skills, data.characters, data.relations, data.timeline]);
-  const recallCandidates = useMemo(() => buildRecall(recallData, vibe, chapter.no), [recallData, vibe, chapter.no]);
+  const localRecallCandidates = useMemo(() => buildRecall(recallData, vibe, chapter.no), [recallData, vibe, chapter.no]);
+  const recallCandidates = useMemo(() => mergeEmbeddingRecall(localRecallCandidates, embedding.hits), [localRecallCandidates, embedding.hits]);
   // 本次真正注入模型的召回条目：以作者勾选为准，最多 MAX_RECALL_ITEMS 条
   const retrieved = useMemo(() => recallCandidates.filter((item) => recallOverrides[item.id] ?? item.recommended).slice(0, MAX_RECALL_ITEMS), [recallCandidates, recallOverrides]);
+  const writingContext = useMemo(() => writingRecallContext(retrieved), [retrieved]);
   // 切换章节或作品时清空手工勾选
   useEffect(() => { setRecallOverrides({}); }, [chapterId, activeBookId]);
   // 手动加入或移除一条召回，超过上限时给出提示
@@ -453,15 +497,23 @@ export default function Home() {
   }
   // Vibe 续写：把召回上下文与提示词发给 /api/generate，逐字写入正文编辑区
   async function generate() {
-    if (generating || imageReadLock.current) return;
+    if (generationLock.current || generating || imageReadLock.current || embedding.busy) return;
     if (!ai) { setToast('AI 已关闭，可以直接手写本章'); return; }
+    generationLock.current = true;
+    const scope = imageDraftKey;
     setImageErrors((old) => ({ ...old, [imageDraftKey]: '' }));
     setGenerating(true); setPending(false);
     try {
-      const response = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vibe, positive, negative, images: storyImages.map((image) => image.dataUrl), systemPrompt: data.book.systemPrompt, context: recallContext(retrieved), connection: modelConnection.enabled ? modelConnection : undefined }) });
+      const skillPayload = prepareWritingSkills(data.skills, selectedSkillIds, vibe);
+      const hits = embeddingEnabled ? await embedding.search() : [];
+      if (writingScope.current !== scope) return;
+      const candidates = embeddingEnabled ? mergeEmbeddingRecall(localRecallCandidates, hits) : localRecallCandidates;
+      const chosen = candidates.filter((item) => recallOverrides[item.id] ?? item.recommended).slice(0, MAX_RECALL_ITEMS);
+      const context = writingRecallContext(chosen);
+      const response = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vibe, positive, negative, images: storyImages.map((image) => image.dataUrl), systemPrompt: data.book.systemPrompt, context: context.context, writingSkills: skillPayload.writingSkills, connection: modelConnection.enabled ? modelConnection : undefined }) });
       const contentType = response.headers.get('content-type') || '';
       if (!response.ok) {
-        const result = contentType.includes('application/json') ? await response.json() : { error: await response.text() };
+        const result = (contentType.includes('application/json') ? await response.json() : { error: await response.text() }) as { error?: string; detail?: string };
         const detail = typeof result.detail === 'string' && result.detail ? `：${result.detail}` : '';
         throw new Error(`${result.error || '生成失败'}${detail}`);
       }
@@ -470,6 +522,7 @@ export default function Home() {
       let generated = '';
       const writeCharacters = async (fragment: string) => {
         for (const character of Array.from(fragment)) {
+          if (writingScope.current !== scope) throw new DOMException('已切换章节，停止写入旧章节', 'AbortError');
           generated += character;
           const next = prefix + generated;
           updateChapter({ content: next, words: next.replace(/\s/g, '').length, status: '草稿' });
@@ -478,10 +531,10 @@ export default function Home() {
         }
       };
       if (contentType.includes('application/json')) {
-        const result = await response.json();
+        const result = await response.json() as { content?: string; provider?: string };
         if (!result.content) throw new Error('模型没有返回正文');
         await writeCharacters(result.content);
-        setProvider(result.provider === 'demo' ? '演示引擎' : result.provider);
+        setProvider(result.provider || '模型服务');
       } else {
         if (!response.body) throw new Error('浏览器无法读取模型的流式响应');
         const reader = response.body.getReader();
@@ -497,9 +550,11 @@ export default function Home() {
       }
       setPending(true);
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       setToast(error instanceof Error ? error.message : '生成失败，请检查模型服务配置');
       if (storyImages.length) setImageErrors((old) => ({ ...old, [imageDraftKey]: error instanceof Error ? error.message : '图文生成失败，请检查模型服务配置' }));
     } finally {
+      generationLock.current = false;
       setGenerating(false);
     }
   }
@@ -567,7 +622,7 @@ export default function Home() {
     finally { setAuditRunning(false); }
   }
   // 提问助手的流式请求、工具循环和历史会话由 useWritingAssistant 管理。
-  // 入库并更新：写入本章召回总结与时间线事件
+  // 入库并更新：写入召回总结与时间线事件
   function ingest() { setData((old) => { const storedChapter = old.chapters.find((item) => item.id === chapter.id) || chapter; const generatedSummary = summarizeChapterText(storedChapter, old.characters, old.relations, old.knowledge); const summary = storedChapter.summaryLocked && storedChapter.summary ? storedChapter.summary : generatedSummary; const timelineEvent = { time: chapter.time, title: chapter.title, detail: summary, chapter: chapter.no, auto: true }; return { ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, status: '已入库', words: item.content.replace(/\s/g, '').length, summary, summaryVersion: 2 } : item), timeline: old.timeline.some((item) => item.chapter === chapter.no) ? old.timeline.map((item) => item.chapter === chapter.no ? timelineEvent : item) : [...old.timeline, timelineEvent] }; }); setPending(false); setToast(chapter.summaryLocked ? '已入库：保留作者锁定的召回总结' : '已入库：已生成白名单召回总结，可在右侧编辑并锁定'); }
   // 新增章节（沿用当前章节的时间与地点锚点）
   function addChapter() { const no = data.chapters.length + 1; const next: Chapter = { id: Date.now(), no, title: `第 ${no} 章`, status: '尚未开始', time: chapter.time, location: chapter.location, content: '', words: 0 }; setData((old) => ({ ...old, chapters: [...old.chapters, next] })); setChapterId(next.id); setVibe(''); setPositive(''); setNegative(''); setShowPrompts(false); setView('editor'); setPending(false); }
@@ -611,16 +666,26 @@ export default function Home() {
     auditRunning, auditProgress, auditReport, auditTarget, onFastAudit: startFastAudit, onReviewSuspects: reviewAuditSuspects,
     assistant, onOpenFull: () => setView('agents' as View),
   };
-  return <main className="studio-shell">{toast && <div className="toast">✓ {toast}</div>}<aside className="rail"><button className="brand-mark brand-button" title="魔方ai故事创作平台 · 我的书库" aria-label="魔方ai故事创作平台 · 我的书库" onClick={() => setView('books')}><img className="brand-cube" src="/favicon.svg" width={32} height={36} alt="" aria-hidden="true" /></button><NavIcon label="书库" name="books" active={view === 'books'} onClick={() => setView('books')} /><NavIcon label="写作台" name="editor" active={view === 'editor'} onClick={() => setView('editor')} /><NavIcon label="并行智能体" name="agents" active={view === 'agents'} onClick={() => setView('agents')} /><NavIcon label="大纲" name="outline" active={view === 'outline'} onClick={() => setView('outline')} /><NavIcon label="知识库" name="knowledge" active={view === 'knowledge'} onClick={() => setView('knowledge')} /><NavIcon label="人物关系" name="relations" active={view === 'relations'} onClick={() => setView('relations')} /><NavIcon label="时间线" name="timeline" active={view === 'timeline'} onClick={() => setView('timeline')} /><NavIcon label="写作技能" name="skills" active={view === 'skills'} onClick={() => setView('skills')} /><div className="rail-spacer" /><NavIcon label="作品设置" name="settings" active={view === 'settings'} onClick={() => setView('settings')} /></aside>
+  const embeddingControls = <>
+    <div className="embedding-controls"><label><input aria-label="Embedding 检索" type="checkbox" checked={embeddingEnabled} disabled={generating} onChange={(event) => changeWritingPreferences({ embeddingEnabled: event.target.checked })} />Embedding 检索</label>
+      {embedding.busy ? <button onClick={embedding.cancel}>停止检索</button> : <button disabled={!embeddingEnabled || !embeddingConnection.enabled || generating || !vibe.trim()} onClick={() => { void embedding.search().catch((error) => { if (!(error instanceof DOMException && error.name === 'AbortError')) setToast(error instanceof Error ? error.message : '检索失败'); }); }}>检索／更新</button>}
+      {!embeddingConnection.enabled && <button onClick={() => setView('settings')}>配置模型</button>}
+      {embedding.status && <span className="embedding-status" role="status">{embedding.status}</span>}
+    </div>
+    {embedding.error && <p className="embedding-notice error" role="alert">{embedding.error}。可修正设置重试，或关闭 Embedding 后使用关键词召回。</p>}
+    {embeddingEnabled && <p className="embedding-notice">点击检索或生成时，才会发送本书知识设定和当前章之前的原文。首次需建立本地索引；输入变化后请重新检索。</p>}
+    <small className="recall-budget">本次资料 {writingContext.chars.toLocaleString()} 字符{writingContext.trimmed ? ' · 长资料已按预算截取' : ''}；相似分不代表事实正确率。</small>
+  </>;
+  return <main className="studio-shell">{toast && <div className="toast">✓ {toast}</div>}<aside className="rail"><button className="brand-mark brand-button" title="魔方AI故事创作平台 · 我的作品" aria-label="魔方AI故事创作平台 · 我的作品" onClick={() => setView('books')}><img className="brand-cube" src="/favicon.svg" width={32} height={36} alt="" aria-hidden="true" /></button><NavIcon label="书库" name="books" active={view === 'books'} onClick={() => setView('books')} /><NavIcon label="写作台" name="editor" active={view === 'editor'} onClick={() => setView('editor')} /><NavIcon label="并行智能体" name="agents" active={view === 'agents'} onClick={() => setView('agents')} /><NavIcon label="大纲" name="outline" active={view === 'outline'} onClick={() => setView('outline')} /><NavIcon label="知识库" name="knowledge" active={view === 'knowledge'} onClick={() => setView('knowledge')} /><NavIcon label="人物关系" name="relations" active={view === 'relations'} onClick={() => setView('relations')} /><NavIcon label="时间线" name="timeline" active={view === 'timeline'} onClick={() => setView('timeline')} /><NavIcon label="写作技能" name="skills" active={view === 'skills'} onClick={() => setView('skills')} /><div className="rail-spacer" /><NavIcon label="作品设置" name="settings" active={view === 'settings'} onClick={() => setView('settings')} /></aside>
     <aside className="chapter-pane"><div className="book-row book-switcher"><div><span className="eyebrow">当前作品</span><strong>{data.book.title}</strong></div><select aria-label="切换书籍" value={activeBookId} onChange={(e) => switchBook(e.target.value)}>{books.map((item) => <option key={item.id} value={item.id}>{item.data.book.title}</option>)}</select></div><button className="new-chapter" onClick={addChapter}>＋ 新建章节</button><div className="pane-label"><span>全部章节</span><span>{data.chapters.length}</span></div><nav className="chapter-list">{data.chapters.map((item) => <div key={item.id} className={`chapter-item ${chapterId === item.id ? 'active' : ''} ${item.status === '已入库' ? 'done' : ''}`}><button className="chapter-select" onClick={() => { setChapterId(item.id); setView('editor'); setPending(false); }}><span className="chapter-no">{String(item.no).padStart(2, '0')}</span><span><b>{item.title}</b><small>{item.words ? `${item.words.toLocaleString()} 字 · ` : ''}{item.status}</small></span></button><button className="delete-chapter" title="删除章节" aria-label={`删除《${item.title}》`} onClick={() => deleteChapter(item.id)}>×</button></div>)}</nav><div className="context-meter"><div className="meter-head"><span>长篇上下文</span><b>{data.chapters.reduce((a, c) => a + c.words, 0).toLocaleString()} / 500 万字</b></div><div className="meter"><i style={{ width: `${Math.max(2, data.chapters.reduce((a, c) => a + c.words, 0) / 50000)}%` }} /></div><small>摘要、实体与时间线持续索引中</small></div></aside>
-    <section className="workspace"><header className="topbar"><div><span className="page-title">{viewMeta[view][0]}</span><span className="page-subtitle">{viewMeta[view][1]}</span></div><div className="top-actions"><span className="saved">● {saved}</span>{view === 'editor' && <><button className="secondary" onClick={() => setView('timeline')}>时间线</button><button className="primary" onClick={ingest}>入库并更新</button></>}</div></header>{view === 'editor' ? <><div className="editor-wrap"><article className="manuscript"><div className="chapter-kicker">CHAPTER {String(chapter.no).padStart(2, '0')} · {chapter.time} · {chapter.location}</div><input className="title-input" value={chapter.title} onChange={(e) => updateChapter({ title: e.target.value })} /><textarea ref={manuscriptRef} className="manuscript-input" value={chapter.content} placeholder="从这里开始写作……" onChange={(e) => updateChapter({ content: e.target.value, words: e.target.value.replace(/\s/g, '').length, status: '草稿' })} /></article></div>{pending && <div className="review-strip"><div><b>AI 草稿已生成</b><span>由 {provider} 生成 · 已写入编辑区，可继续修改</span></div><button className="secondary" onClick={() => setPending(false)}>继续修改</button><button className="primary" onClick={ingest}>直接入库</button></div>}<section className="vibe-dock"><div className="dock-head"><div><span className="spark">✦</span><strong>Vibe 续写</strong><small>{generating ? '模型正在逐字写入正文' : `已选择 ${retrieved.length} 条上下文`}</small></div><label className="ai-toggle"><input type="checkbox" checked={ai} onChange={(e) => setAi(e.target.checked)} /><span /> AI 助写</label></div><textarea aria-label="剧情意图" value={vibe} onChange={(e) => setVibe(e.target.value)} placeholder="输入本章希望发生的剧情……也可以上传图片，描述人物、场景和希望发生的故事。" /><StoryImageInput images={storyImages} busy={generating} loading={readingImages} error={imageErrors[imageDraftKey] || ''} onSelect={addStoryImages} onRemove={removeStoryImage} />{showPrompts && <div className="prompt-grid"><label>正向提示<input value={positive} onChange={(e) => setPositive(e.target.value)} /></label><label>反向提示<input value={negative} onChange={(e) => setNegative(e.target.value)} /></label></div>}<div className="chips"><button onClick={() => setShowPrompts(!showPrompts)}>{showPrompts ? '收起提示词' : '＋ 正反提示词'}</button><span title={retrieved.map((x) => `${x.title}（${x.reason}）`).join('、')}>召回：{retrieved.slice(0, 4).map((x) => x.title).join('、') || '尚未选择'}{retrieved.length > 4 ? ` 等 ${retrieved.length} 条` : ''}</span><button className="generate" disabled={generating || readingImages} onClick={generate}>{generating ? '正在逐字生成…' : ai ? '生成草稿' : '关闭 AI，手动写作'} <kbd>⌘ ↵</kbd></button></div></section></> : view === 'agents' ? <AgentWorkspace writingRunning={generating} onOpenWriter={() => setView('editor')} auditRunning={auditRunning} auditProgress={auditProgress} auditReport={auditReport} auditTarget={auditTarget} onFastAudit={startFastAudit} onReviewSuspects={reviewAuditSuspects} uploadedNovel={uploadedNovel} txtConfirmed={txtConfirmed} onTxtConfirmed={setTxtConfirmed} onChooseTxt={chooseNovelTxt} onTxtAudit={startTxtDeepAudit} assistant={assistant} /> : view === 'books' ? <BooksHome books={books.map((item) => item.id === activeBookId ? { ...item, data } : item)} activeBookId={activeBookId} onOpen={switchBook} onCreate={createBook} onDelete={deleteBook} /> : <Panel view={view} data={data} setData={setData} setToast={setToast} modelConnection={modelConnection} setModelConnection={setModelConnection} />}</section>{view === 'editor' && <Inspector chapter={chapter} candidates={recallCandidates} selectedIds={new Set(retrieved.map((item) => item.id))} onToggleRecall={toggleRecall} data={data} setData={setData} setToast={setToast} summaryOptimizing={summaryOptimizing} onOptimizeSummary={optimizeChapterSummary} />}{view === 'editor' && <WriterAgentFloat {...writerAgentProps} />}{homeDialog && <EditDialog config={homeDialog} onClose={() => setHomeDialog(null)} />}</main>;
+    <section className="workspace"><header className="topbar"><div><span className="page-title">{viewMeta[view][0]}</span><span className="page-subtitle">{viewMeta[view][1]}</span></div><div className="top-actions"><span className="saved">● {saved}</span>{view === 'editor' && <><button className="secondary" onClick={() => setView('timeline')}>时间线</button><button className="primary" onClick={ingest}>入库并更新</button></>}</div></header>{view === 'editor' ? <><div className="editor-wrap"><article className="manuscript"><div className="chapter-kicker">CHAPTER {String(chapter.no).padStart(2, '0')} · {chapter.time} · {chapter.location}</div><input className="title-input" value={chapter.title} onChange={(e) => updateChapter({ title: e.target.value })} /><textarea ref={manuscriptRef} className="manuscript-input" value={chapter.content} placeholder="从这里开始写作……" onChange={(e) => updateChapter({ content: e.target.value, words: e.target.value.replace(/\s/g, '').length, status: '草稿' })} /></article></div>{pending && <div className="review-strip"><div><b>AI 草稿已生成</b><span>由 {provider} 生成 · 已写入编辑区，可继续修改</span></div><button className="secondary" onClick={() => setPending(false)}>继续修改</button><button className="primary" onClick={ingest}>直接入库</button></div>}<section className="vibe-dock"><div className="dock-head"><div><span className="spark">✦</span><strong>Vibe 续写</strong><small>{generating ? '模型正在逐字写入正文' : `已选择 ${retrieved.length} 条上下文`}</small></div><label className="ai-toggle"><input type="checkbox" checked={ai} onChange={(e) => setAi(e.target.checked)} /><span /> AI 助写</label></div><WritingSkillInput key={activeBookId} skills={data.skills} selectedIds={selectedSkillIds} onSelectionChange={(ids) => changeWritingPreferences({ selectedSkillIds: ids })} value={vibe} onChange={setVibe} disabled={generating} placeholder="输入剧情意图，输入 / 选择写作技能；也可以上传图片描述故事。" /><StoryImageInput images={storyImages} busy={generating} loading={readingImages} error={imageErrors[imageDraftKey] || ''} onSelect={addStoryImages} onRemove={removeStoryImage} />{showPrompts && <div className="prompt-grid"><label>正向提示<input value={positive} onChange={(e) => setPositive(e.target.value)} /></label><label>反向提示<input value={negative} onChange={(e) => setNegative(e.target.value)} /></label></div>}<div className="chips"><button onClick={() => setShowPrompts(!showPrompts)}>{showPrompts ? '收起提示词' : '＋ 正反提示词'}</button><span title={retrieved.map((x) => `${x.title}（${x.reason}）`).join('、')}>召回：{retrieved.slice(0, 4).map((x) => x.title).join('、') || '尚未选择'}{retrieved.length > 4 ? ` 等 ${retrieved.length} 条` : ''}</span><button className="generate" disabled={generating || readingImages || embedding.busy} onClick={generate}>{generating ? '正在逐字生成…' : ai ? '生成草稿' : '关闭 AI，手动写作'} <kbd>⌘ ↵</kbd></button></div></section></> : view === 'agents' ? <AgentWorkspace writingRunning={generating} onOpenWriter={() => setView('editor')} auditRunning={auditRunning} auditProgress={auditProgress} auditReport={auditReport} auditTarget={auditTarget} onFastAudit={startFastAudit} onReviewSuspects={reviewAuditSuspects} uploadedNovel={uploadedNovel} txtConfirmed={txtConfirmed} onTxtConfirmed={setTxtConfirmed} onChooseTxt={chooseNovelTxt} onTxtAudit={startTxtDeepAudit} assistant={assistant} /> : view === 'books' ? <BooksHome books={books.map((item) => item.id === activeBookId ? { ...item, data } : item)} activeBookId={activeBookId} onOpen={switchBook} onCreate={createBook} onDelete={deleteBook} /> : <Panel key={activeBookId} view={view} data={data} setData={setData} setToast={setToast} modelConnection={modelConnection} setModelConnection={setModelConnection} embeddingConnection={embeddingConnection} setEmbeddingConnection={setEmbeddingConnection} bookId={activeBookId} />}</section>{view === 'editor' && <Inspector chapter={chapter} embeddingControls={embeddingControls} candidates={recallCandidates} selectedIds={new Set(retrieved.map((item) => item.id))} onToggleRecall={toggleRecall} data={data} setData={setData} setToast={setToast} summaryOptimizing={summaryOptimizing} onOptimizeSummary={optimizeChapterSummary} />}{view === 'editor' && <WriterAgentFloat {...writerAgentProps} />}{homeDialog && <EditDialog config={homeDialog} onClose={() => setHomeDialog(null)} />}</main>;
 }
 
 
 // 书库首页：作品卡片网格，用于打开、创建或删除作品
 function BooksHome({ books, activeBookId, onOpen, onCreate, onDelete }: { books: BookRecord[]; activeBookId: string; onOpen: (id: string) => void; onCreate: () => void; onDelete: (id: string) => void }) {
   return <div className="content-page books-home">
-    <div className="library-hero"><div><span>魔方ai故事创作平台</span><h1>我的书库</h1><p>每本书都拥有独立的章节、世界观、人物关系、Skills 与写作风格。</p></div><button className="primary" onClick={onCreate}>＋ 创建新书</button></div>
+    <div className="library-hero"><div><span>魔方AI故事创作平台</span><h1>我的作品</h1><p>每本书都拥有独立的章节、世界观、人物关系、Skills 与写作风格。</p></div><button className="primary" onClick={onCreate}>＋ 创建新书</button></div>
     <div className="book-grid">{books.map((item) => <article className={item.id === activeBookId ? 'active' : ''} key={item.id}>
       <button className="book-cover" onClick={() => onOpen(item.id)}><span>{item.data.book.genre}</span><b>{item.data.book.title}</b><small>{item.data.chapters.length} 章 · {item.data.chapters.reduce((sum, chapter) => sum + chapter.words, 0).toLocaleString()} 字</small></button>
       <footer><button onClick={() => onOpen(item.id)}>{item.id === activeBookId ? '继续写作' : '打开作品'}</button><button className="danger" onClick={() => onDelete(item.id)}>删除</button></footer>
@@ -682,7 +747,7 @@ function AgentWorkspace({ writingRunning, onOpenWriter, auditRunning, auditProgr
 // 左侧导航按钮：图标加悬停中文提示，active 表示当前页面
 function NavIcon({ label, name, active, onClick }: { label: string; name: RailIconName; active: boolean; onClick: () => void }) { return <button aria-label={label} data-label={label} className={`rail-button ${active ? 'active' : ''}`} onClick={onClick}><RailIcon name={name} /></button>; }
 // 右侧检查器：本章时间锚点、召回总结、召回候选、人物档案与全部设定
-function Inspector({ chapter, candidates, selectedIds, onToggleRecall, data, setData, setToast, summaryOptimizing, onOptimizeSummary }: { chapter: Chapter; candidates: RecallItem[]; selectedIds: Set<string>; onToggleRecall: (item: RecallItem) => void; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void; summaryOptimizing: boolean; onOptimizeSummary: () => void }) {
+function Inspector({ chapter, embeddingControls, candidates, selectedIds, onToggleRecall, data, setData, setToast, summaryOptimizing, onOptimizeSummary }: { chapter: Chapter; embeddingControls: React.ReactNode; candidates: RecallItem[]; selectedIds: Set<string>; onToggleRecall: (item: RecallItem) => void; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void; summaryOptimizing: boolean; onOptimizeSummary: () => void }) {
   const [tab, setTab] = useState<'context' | 'characters' | 'knowledge'>('context');
   const [dialog, setDialog] = useState<DialogConfig | null>(null);
   const primaryRelation = data.relations[0];
@@ -716,7 +781,7 @@ function Inspector({ chapter, candidates, selectedIds, onToggleRecall, data, set
     {tab === 'context' && <>
       <section className="inspector-section"><div className="section-title"><span>本章时间锚点</span><button onClick={editTime}>编辑</button></div><div className="time-card"><b>{timeDisplay.date}</b><span>{timeDisplay.detail ? `${timeDisplay.detail} · ` : ''}{chapter.location}</span><small>所有事件将以此时间点入库</small></div></section>
       <section className="inspector-section chapter-summary"><div className="section-title"><span>本章召回总结 · {chapter.summaryLocked ? '已锁定' : '可更新'}</span><button onClick={editSummary}>编辑</button></div><pre>{visibleSummary}</pre><div className="summary-actions"><button className="summary-ai" disabled={summaryOptimizing || !chapter.content.trim()} onClick={onOptimizeSummary}>{summaryOptimizing ? 'AI 正在精炼…' : 'AI 优化总结'}</button><button onClick={rebuildSummary}>按档案重建</button><button onClick={() => { setData((old) => ({ ...old, chapters: old.chapters.map((item) => item.id === chapter.id ? { ...item, summaryLocked: !item.summaryLocked, summary: item.summary || visibleSummary, summaryVersion: 2 } : item) })); setToast(chapter.summaryLocked ? '总结已解锁，下次入库可以更新' : '总结已锁定，入库不会覆盖'); }}>{chapter.summaryLocked ? '解除锁定' : '锁定当前版本'}</button></div></section>
-      <section className="inspector-section"><div className="section-title"><span>召回候选 · 已选 {selectedIds.size}</span><button onClick={() => setToast('可按匹配度手动加入或移除')}>使用说明</button></div><div className="recall-options">{candidates.map((item) => { const selected = selectedIds.has(item.id); return <article className={`recall-option ${selected ? 'selected' : ''}`} key={item.id}><header><span>{item.type} · {item.reason}</span><strong>{item.score}%</strong></header><b>{item.title}</b><p>{item.body}</p><button onClick={() => onToggleRecall(item)}>{selected ? '移除本次召回' : '＋ 加入本次召回'}</button></article>; })}</div></section>
+      <section className="inspector-section"><div className="section-title"><span>召回候选 · 已选 {selectedIds.size}</span><button onClick={() => setToast('可按匹配度手动加入或移除')}>使用说明</button></div>{embeddingControls}<div className="recall-options">{candidates.map((item) => { const selected = selectedIds.has(item.id); return <article className={`recall-option ${selected ? 'selected' : ''}`} key={item.id}><header><span>{item.type} · {item.reason}</span><strong>{item.score}%</strong></header><b>{item.title}</b><p>{item.body}</p><button onClick={() => onToggleRecall(item)}>{selected ? '移除本次召回' : '＋ 加入本次召回'}</button></article>; })}</div></section>
       <section className="inspector-section relation"><div className="section-title"><span>当前人物关系</span><button onClick={() => setToast(primaryRelation ? '已读取作者维护的人物关系' : '新书尚未建立人物关系')}>刷新</button></div>{primaryRelation ? <><div><span className="avatar">{primaryRelation.from.slice(0, 1)}</span><i>关系 {primaryRelation.score}</i><span className="avatar coral">{primaryRelation.to.slice(0, 1)}</span></div><p>{primaryRelation.from} · {primaryRelation.label} · {primaryRelation.to}</p></> : <div className="empty-recall">尚未建立人物关系。请前往人物关系页面手动添加人物和关系。</div>}</section>
     </>}
     {tab === 'characters' && <section className="inspector-section inspector-list"><div className="section-title"><span>人物档案</span><button onClick={() => setToast('人物状态由作者手动维护，入库不会自动改写')}>状态来源</button></div>{data.characters.map((item, index) => <button className="inspector-person" key={item.name} onClick={() => setDialog({ title: `修改 ${item.name} 的状态`, description: '该状态由作者维护，并会参与后续章节召回。', confirmText: '保存状态', fields: [{ key: 'state', label: '人物状态', value: item.state, multiline: true }, { key: 'location', label: '当前位置', value: item.location }], onSubmit: (values) => { setData((old) => ({ ...old, characters: old.characters.map((c, i) => i === index ? { ...c, state: values.state.trim(), location: values.location.trim() } : c) })); setDialog(null); setToast('人物状态已更新'); } })}><span className="avatar">{item.name[0]}</span><span><b>{item.name} · {item.role}</b><small>{item.state}</small><em>{item.location}</em></span></button>)}</section>}
@@ -757,11 +822,14 @@ function ExpandableKnowledgeBody({ body }: { body: string }) {
 }
 
 // 写作台以外各页面的容器：大纲、知识库、技能、时间线、人物关系与作品设置
-function Panel({ view, data, setData, setToast, modelConnection, setModelConnection }: { view: Exclude<View, 'editor'>; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void; modelConnection: ModelConnection; setModelConnection: React.Dispatch<React.SetStateAction<ModelConnection>> }) {
+function Panel({ view, data, setData, setToast, modelConnection, setModelConnection, embeddingConnection, setEmbeddingConnection, bookId }: { view: Exclude<View, 'editor'>; data: WorkspaceData; setData: React.Dispatch<React.SetStateAction<WorkspaceData>>; setToast: (s: string) => void; modelConnection: ModelConnection; setModelConnection: React.Dispatch<React.SetStateAction<ModelConnection>>; embeddingConnection: EmbeddingSettingsValue; setEmbeddingConnection: React.Dispatch<React.SetStateAction<EmbeddingSettingsValue>>; bookId: string }) {
   const [selectedCharacter, setSelectedCharacter] = useState<string | null>(null);
   const [batchCharacters, setBatchCharacters] = useState<string[]>([]);
   const [batchRelations, setBatchRelations] = useState<number[]>([]);
   const [dialog, setDialog] = useState<DialogConfig | null>(null);
+  const [importingSkill, setImportingSkill] = useState(false);
+  const skillImportActive = useRef(true);
+  useEffect(() => { skillImportActive.current = true; return () => { skillImportActive.current = false; }; }, []);
   const characterMarks = [
     { id: 'active', label: '活跃', color: '#4b6671' },
     { id: 'important', label: '重要', color: '#bd5b3e' },
@@ -805,17 +873,30 @@ function Panel({ view, data, setData, setToast, modelConnection, setModelConnect
     } });
   };
   const addSkill = () => {
-    setDialog({ title: '创建写作 Skill', description: '写下这项 Skill 应遵循的写作规则。', confirmText: '创建 Skill', fields: [{ key: 'title', label: 'Skill 名称', value: '' }, { key: 'description', label: '详细写作规则', value: '', multiline: true }], onSubmit: (values) => {
+    setDialog({ title: '创建写作 Skill', description: '核心规则会在选中后完整发送，单项最多 12000 字符。', confirmText: '创建 Skill', fields: [{ key: 'title', label: 'Skill 名称', value: '' }, { key: 'description', label: '简短说明', value: '' }, { key: 'instructions', label: '核心写作规则', value: '', multiline: true }], onSubmit: (values) => {
       if (!values.title.trim()) { setToast('请填写 Skill 名称'); return; }
-      setData((old) => ({ ...old, skills: [...old.skills, { title: values.title.trim(), description: values.description.trim(), enabled: true }] })); setDialog(null); setToast('Skill 已添加');
+      if (values.title.trim().length > 100 || !values.instructions.trim() || values.instructions.length > 12000) { setToast('名称最多 100 字符，核心规则需填写且最多 12000 字符'); return; }
+      setData((old) => ({ ...old, skills: [...old.skills, { id: crypto.randomUUID(), title: values.title.trim(), description: values.description.trim(), instructions: values.instructions.trim(), enabled: true }] })); setDialog(null); setToast('Skill 已添加，在写作台输入 / 选择使用');
     } });
   };
   const editSkill = (item: WorkspaceData['skills'][number], index: number) => {
-    setDialog({ title: '编辑写作 Skill', description: '调整名称或详细执行规则。', confirmText: '保存修改', fields: [{ key: 'title', label: 'Skill 名称', value: item.title }, { key: 'description', label: '写作规则', value: item.description, multiline: true }], onSubmit: (values) => {
+    setDialog({ title: '编辑写作 Skill', description: '参考资料保持不变，修改核心规则后会用于下次生成。', confirmText: '保存修改', fields: [{ key: 'title', label: 'Skill 名称', value: item.title }, { key: 'description', label: '简短说明', value: item.instructions ? item.description : '' }, { key: 'instructions', label: '核心写作规则', value: item.instructions || item.description, multiline: true }], onSubmit: (values) => {
       if (!values.title.trim()) { setToast('请填写 Skill 名称'); return; }
-      setData((old) => ({ ...old, skills: old.skills.map((x, i) => i === index ? { ...x, title: values.title.trim(), description: values.description.trim() } : x) })); setDialog(null); setToast('Skill 已更新');
+      if (values.title.trim().length > 100 || !values.instructions.trim() || values.instructions.length > 12000) { setToast('名称最多 100 字符，核心规则需填写且最多 12000 字符'); return; }
+      setData((old) => ({ ...old, skills: old.skills.map((x, i) => i === index ? { ...x, title: values.title.trim(), description: values.description.trim(), instructions: values.instructions.trim() } : x) })); setDialog(null); setToast('Skill 已更新');
     } });
   };
+  async function importSkillPackage(file: File | null) {
+    if (!file || importingSkill) return;
+    setImportingSkill(true);
+    try {
+      const skill = await importWritingSkillZip(file);
+      if (!skillImportActive.current) return;
+      setData((old) => ({ ...old, skills: [...old.skills, skill] }));
+      setToast(`已导入“${skill.title}”，在写作台输入 / 选择使用`);
+    } catch (error) { if (skillImportActive.current) setToast(error instanceof Error ? error.message : 'Skill 导入失败'); }
+    finally { if (skillImportActive.current) setImportingSkill(false); }
+  }
   const addCharacter = () => {
     setDialog({ title: '添加人物', description: '人物建立后即可参与关系网络和后续章节召回。', confirmText: '添加人物', fields: [{ key: 'name', label: '姓名', value: '' }, { key: 'role', label: '角色定位', value: '配角', placeholder: '男主、女主、配角、反派' }, { key: 'state', label: '当前状态', value: '状态待补充', multiline: true }, { key: 'location', label: '当前位置', value: '地点待确认' }], onSubmit: (values) => {
       const name = values.name.trim();
@@ -880,7 +961,11 @@ function Panel({ view, data, setData, setToast, modelConnection, setModelConnect
 
   if (view === 'outline') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.outline.length} 卷 · 可新增、编辑和删除</p><button className="primary" onClick={addOutline}>＋ 新建卷</button></div><div className="outline-grid">{data.outline.map((item, i) => <article className="outline-card" key={i}><span>0{i + 1}</span><em>{item.state}</em><h2>{item.title}</h2><p>{item.summary}</p><footer className="card-actions"><button onClick={() => editOutline(item, i)}>编辑</button><button className="danger" onClick={() => remove('outline', i, item.title)}>删除</button></footer></article>)}</div></div>);
   if (view === 'knowledge') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.knowledge.length} 条设定 · 可新增、编辑和删除</p><button className="primary" onClick={addKnowledge}>＋ 添加知识</button></div><div className="knowledge-grid">{data.knowledge.map((item, i) => <article className="knowledge-card" key={i}><div><span>{item.type}</span><button onClick={() => editKnowledge(item, i)}>编辑</button></div><h3>{item.title}</h3><ExpandableKnowledgeBody body={item.body} /><footer>{item.tags.map((tag) => <i key={tag}>#{tag}</i>)}</footer><div className="card-actions"><button onClick={() => editKnowledge(item, i)}>编辑</button><button className="danger" onClick={() => remove('knowledge', i, item.title)}>删除</button></div></article>)}</div></div>);
-  if (view === 'skills') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.skills.length} 个 Skills · 可配置内容</p><button className="primary" onClick={addSkill}>＋ 创建 Skill</button></div><div className="skills-list">{data.skills.map((item, index) => <article key={index}><div className="skill-icon">{item.title.slice(0, 1)}</div><button className="skill-edit" onClick={() => editSkill(item, index)}><h3>{item.title}</h3><p>{item.description}</p></button><label className="ai-toggle"><input type="checkbox" checked={item.enabled} onChange={(e) => setData((d) => ({ ...d, skills: d.skills.map((s, i) => i === index ? { ...s, enabled: e.target.checked } : s) }))} /><span /></label><button className="danger compact" onClick={() => remove('skills', index, item.title)}>删除</button></article>)}</div></div>);
+  if (view === 'skills') return withDialog(<div className="content-page">
+    <div className="content-toolbar"><p>{data.skills.length} 个 Skills · 启用后，在写作台输入 / 选择本次使用的技能</p><div className="skill-import-actions"><label className="file-button">{importingSkill ? '正在导入…' : '导入 Skill ZIP'}<input aria-label="导入 Skill ZIP" type="file" accept=".zip,application/zip" disabled={importingSkill} onChange={(event) => { const file = event.currentTarget.files?.[0] || null; event.currentTarget.value = ''; void importSkillPackage(file); }} /></label><button className="primary" onClick={addSkill}>＋ 创建 Skill</button></div></div>
+    <p className="skill-import-help">压缩包包含 SKILL.md，可附带 references/ 下的文本资料。核心规则完整发送，参考资料只按本次意图加载相关片段；每次最多选 3 个技能。</p>
+    <div className="skills-list">{data.skills.map((item, index) => <article key={getWritingSkillId(item, index)}><div className="skill-icon">{item.title.slice(0, 1)}</div><button className="skill-edit" onClick={() => editSkill(item, index)}><h3>{item.title}</h3><p>{item.description || item.instructions?.slice(0, 120)}</p><small>{(item.instructions || item.description).length.toLocaleString()} 字符核心规则{item.references?.length ? ` · ${item.references.length} 份参考资料` : ''}</small></button><label className="ai-toggle"><input aria-label={`启用技能 ${item.title}`} type="checkbox" checked={item.enabled} onChange={(e) => setData((d) => ({ ...d, skills: d.skills.map((s, i) => i === index ? { ...s, enabled: e.target.checked } : s) }))} /><span /></label><button className="danger compact" onClick={() => remove('skills', index, item.title)}>删除</button></article>)}</div>
+  </div>);
   if (view === 'timeline') {
     // 自定义历法的年份可能重置，因此时间线以章节号排序，时间只用于同一章内的先后比较
     const events = [...data.timeline].sort((a, b) => a.chapter - b.chapter || a.time.localeCompare(b.time, 'zh-CN', { numeric: true }));
@@ -905,7 +990,7 @@ function Panel({ view, data, setData, setToast, modelConnection, setModelConnect
       <RelationGraph characters={data.characters} relations={data.relations} selectedName={selected} onSelect={setSelectedCharacter} />
     </div><section className="relation-records"><header><div><h2>全部关系</h2><p>关系名称和强度由作者添加与维护。</p></div><div className="batch-actions"><button onClick={() => setBatchRelations(batchRelations.length === data.relations.length ? [] : data.relations.map((_, index) => index))}>{batchRelations.length === data.relations.length && data.relations.length ? '取消全选' : '全选关系'}</button><span>已选 {batchRelations.length}</span><button className="danger" disabled={!batchRelations.length} onClick={deleteSelectedRelations}>删除所选</button><button className="primary" onClick={() => relationDialog()}>＋ 添加关系</button></div></header>{data.relations.length === 0 ? <div className="empty-state">尚无关系记录。请先添加至少两个人物，再建立第一条关系。</div> : <div>{data.relations.map((item, index) => <article className="relation-record" key={`${item.from}-${item.to}-${index}`}><input aria-label={`选择${item.from}与${item.to}的关系`} type="checkbox" checked={batchRelations.includes(index)} onChange={(event) => setBatchRelations((old) => event.target.checked ? [...old, index] : old.filter((relationIndex) => relationIndex !== index))} /><span className="avatar">{item.from[0]}</span><div><b>{item.from} ↔ {item.to}</b><p>{item.label}</p></div><strong>{item.score}</strong><button onClick={() => relationDialog(item, index)}>编辑</button><button className="danger" onClick={() => deleteRelation(index, item)}>删除</button></article>)}</div>}</section></div>);
   }
-  return withDialog(<div className="content-page settings-page"><section><h2>本书系统提示词</h2><p>每本书可拥有独立的叙事声音与约束。</p><textarea value={data.book.systemPrompt} onChange={(e) => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: e.target.value } }))} /><div className="preset-row"><button onClick={() => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: '用冷静、克制的第三人称限知写作。减少解释，以感官细节和留白制造悬疑。' } }))}>克制悬疑</button><button onClick={() => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: '使用轻快、自然的对白推动情节，保持人物之间的化学反应与幽默感。' } }))}>轻喜剧</button><button onClick={() => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: '采用节奏明快的类型文学写法，每章结尾设置强钩子。' } }))}>类型爽文</button></div></section><section><h2>500 万字上下文策略</h2><div className="strategy"><b>① 近期正文</b><span>保留最近章节原文</span></div><div className="strategy"><b>② 分层摘要</b><span>章节 → 卷 → 全书摘要</span></div><div className="strategy"><b>③ 混合召回</b><span>关键词权重＋本地向量相似度</span></div><div className="strategy"><b>④ 强制上下文</b><span>命中人物、人物关系与最近时间线</span></div></section><ModelSettings value={modelConnection} onChange={setModelConnection} setToast={setToast} /><PromptGuide /></div>);
+  return withDialog(<div className="content-page settings-page"><section><h2>本书系统提示词</h2><p>每本书可拥有独立的叙事声音与约束。点击下方预设可替换提示词，填入后仍可继续编辑。</p><textarea aria-label="本书系统提示词" value={data.book.systemPrompt} onChange={(e) => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: e.target.value } }))} /><div className="preset-row">{WRITING_PROMPT_PRESETS.map((preset) => <button key={preset.label} type="button" title={`使用${preset.label}预设，替换本书系统提示词`} onClick={() => setData((d) => ({ ...d, book: { ...d.book, systemPrompt: preset.prompt } }))}>{preset.label}</button>)}</div></section><section><h2>500 万字上下文策略</h2><div className="strategy"><b>① 近期正文</b><span>保留最近章节原文</span></div><div className="strategy"><b>② 分层摘要</b><span>章节 → 卷 → 全书摘要</span></div><div className="strategy"><b>③ 混合召回</b><span>关键词、词频匹配＋可选 Embedding 语义检索</span></div><div className="strategy"><b>④ 强制上下文</b><span>命中人物、人物关系与最近时间线</span></div></section><ModelSettings value={modelConnection} onChange={setModelConnection} setToast={setToast} /><EmbeddingSettings value={embeddingConnection} onChange={setEmbeddingConnection} bookId={bookId} setToast={setToast} /><PromptGuide /></div>);
 }
 
 // 模型连接设置：填写接口地址、API Key 与模型名，仅本机访问时记住配置
@@ -941,7 +1026,7 @@ function EditDialog({ config, onClose }: { config: DialogConfig; onClose: () => 
       if (event.key === 'Enter' && (composing.current || event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229)) event.preventDefault();
     },
   };
-  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="edit-dialog" role="dialog" aria-modal="true" aria-label={config.title} onSubmit={(event) => { event.preventDefault(); if (!composing.current) config.onSubmit(values); }}><header><div><span>MOJING EDITOR</span><h2>{config.title}</h2>{config.description && <p>{config.description}</p>}</div><button type="button" aria-label="关闭弹窗" onClick={onClose}>×</button></header><div className="dialog-fields">{config.fields.map((field, index) => <label key={field.key}>{field.label}{field.multiline ? <textarea {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} /> : <input {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} />}</label>)}</div><footer><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">{config.confirmText || '保存'}</button></footer></form></div>;
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="edit-dialog" role="dialog" aria-modal="true" aria-label={config.title} onSubmit={(event) => { event.preventDefault(); if (!composing.current) config.onSubmit(values); }}><header><div><span>魔方AI故事创作平台</span><h2>{config.title}</h2>{config.description && <p>{config.description}</p>}</div><button type="button" aria-label="关闭弹窗" onClick={onClose}>×</button></header><div className="dialog-fields">{config.fields.map((field, index) => <label key={field.key}>{field.label}{field.multiline ? <textarea {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} /> : <input {...compositionProps} autoFocus={index === 0} value={values[field.key] || ''} placeholder={field.placeholder} onChange={(event) => setValues((old) => ({ ...old, [field.key]: event.target.value }))} />}</label>)}</div><footer><button type="button" className="secondary" onClick={onClose}>取消</button><button type="submit" className="primary">{config.confirmText || '保存'}</button></footer></form></div>;
 }
 
 // 设置页的说明区：展示发给模型的结构与写作建议
@@ -950,12 +1035,13 @@ function PromptGuide() {
 本书的叙事风格、视角与写作约束
 
 【用户提问】
-相关上下文：文本＋本地向量筛选的知识库内容
+相关上下文：关键词、词频匹配的设定；开启后补充 Embedding 语义检索片段
+写作技能：本次选中的核心规则，以及按需读取的参考片段
 前文连续性：最近 3 个已入库章节的正文摘要，含上一章结尾片段
 强制上下文：Vibe 命中的人物状态和关系、最近 2 条时间线
 剧情意图：写作台填写的 Vibe
 正向要求：希望加强的风格、节奏与表现
 避免：不希望出现的内容与写法
 
-只输出小说正文。`}</pre><h3>获得更好反馈前，建议先写好</h3><ul><li><b>系统提示词：</b>人称、视角、文风、节奏、目标篇幅和禁忌。</li><li><b>知识库：</b>人物性格与当前状态、世界规则、地点、重要道具和已发生事实。</li><li><b>Vibe：</b>本章起点、主要事件、冲突、转折、结尾落点，以及哪些角色必须出场。</li><li><b>正向提示：</b>需要强化的情绪、感官、对白或悬念。</li><li><b>反向提示：</b>不能改动的设定、不能提前揭露的信息，以及要避免的套路。</li></ul><p className="guide-note">召回在本地完成，不会为了检索把整套知识库发送给第三方向量服务。生成时会发送最终选中的知识设定，以及最近已入库章节的本地摘要；上一章会额外附带末尾 600 字用于衔接，不会发送整本正文或大纲。</p></section>;
+只输出小说正文。`}</pre><h3>获得更好反馈前，建议先写好</h3><ul><li><b>系统提示词：</b>人称、视角、文风、节奏、目标篇幅和禁忌。</li><li><b>知识库：</b>人物性格与当前状态、世界规则、地点、重要道具和已发生事实。</li><li><b>Vibe：</b>本章起点、主要事件、冲突、转折、结尾落点，以及哪些角色必须出场。</li><li><b>正向提示：</b>需要强化的情绪、感官、对白或悬念。</li><li><b>反向提示：</b>不能改动的设定、不能提前揭露的信息，以及要避免的套路。</li></ul><p className="guide-note">默认使用本地关键词与词频召回。开启 Embedding 后，点击检索或生成时会向你配置的向量模型发送本书知识设定、当前章节之前的原文及剧情意图，向量缓存在当前浏览器。写作模型会收到最终选中的资料、前文连续性材料，以及本次选中 Skill 的核心规则和相关参考片段；长资料受字符预算限制。</p></section>;
 }

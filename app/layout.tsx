@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 // 站点元信息：浏览器标题与搜索引擎描述。
 export const metadata: Metadata = {
-  title: '魔方ai故事创作平台',
+  title: '魔方AI故事创作平台',
   description: '支持 Vibe 驱动、设定召回、时间线溯源与人物状态更新的长篇小说编辑器。',
   icons: { icon: '/favicon.svg' },
 };
