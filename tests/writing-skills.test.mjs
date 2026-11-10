@@ -106,7 +106,7 @@ test('ZIP parser rejects path traversal, duplicate names, encrypted files and sy
 test('ZIP parser rejects malformed, excessive or dishonest payloads', async () => {
   await assert.rejects(importWritingSkillZip(new Blob(['not zip'])), /无法识别/);
   await assert.rejects(importWritingSkillZip(new Blob([new Uint8Array(2 * 1024 * 1024 + 1)])), /2 MB/);
-  await assert.rejects(importWritingSkillZip(zip([{ path: 'README.md', text: 'missing' }])), /SKILL.md/);
+  await assert.rejects(importWritingSkillZip(zip([{ path: 'scripts/run.js', text: 'console.log(1)' }])), /可导入的文本/);
   await assert.rejects(importWritingSkillZip(zip([{ path: 'SKILL.md', text: '规则', declaredSize: 140000 }])), /解压体积/);
   await assert.rejects(importWritingSkillZip(zip([{ path: 'SKILL.md', text: '# 名称\n' + '规则'.repeat(6200) }])), /12000/);
   await assert.rejects(importWritingSkillZip(zip([{ path: 'SKILL.md', text: '---\nname: 未结束\n# 正文' }])), /结束分隔线/);
@@ -120,4 +120,29 @@ test('blank frontmatter fields do not swallow the following metadata line', asyn
   const result = await importWritingSkillZip(zip([{ path: 'SKILL.md', text: '---\nname:\ndescription: 一行简介\n---\n# 标题兜底\n正文规则' }]));
   assert.equal(result.title, '标题兜底');
   assert.equal(result.description, '一行简介');
+});
+
+// 没有 SKILL.md 的技能包（例如只带 references/ 的规则集）应当照常导入，而不是被拒绝。
+test('a package without SKILL.md imports its text rules instead of being rejected', async () => {
+  const result = await importWritingSkillZip(zip([
+    { path: 'story-deslop/references/narrative-focus.md', text: '规则甲：删掉解释性旁白。' },
+    { path: 'story-deslop/references/story-logic.md', text: '规则乙：因果必须落在纸面上。' },
+    { path: 'story-deslop/scripts/check-ai-patterns.js', text: 'console.log(1)' },
+  ]));
+  assert.equal(result.title, 'story-deslop');
+  assert.match(result.instructions, /规则甲/);
+  assert.match(result.instructions, /规则乙/);
+  assert.deepEqual(result.references, []);
+});
+
+test('rules beyond the core budget become on-demand references and multiple manifests stay rejected', async () => {
+  const block = '规则'.repeat(4000);
+  const result = await importWritingSkillZip(zip([
+    { path: 'pack/a.md', text: '甲：' + block },
+    { path: 'pack/b.md', text: '乙：' + block },
+  ]));
+  assert.ok(result.instructions.length <= 12000);
+  assert.equal(result.references.length, 1);
+  assert.equal(result.references[0].path, 'b.md');
+  await assert.rejects(importWritingSkillZip(zip([{ path: 'a/SKILL.md', text: '规则' }, { path: 'b/SKILL.md', text: '规则' }])), /多个 SKILL\.md/);
 });

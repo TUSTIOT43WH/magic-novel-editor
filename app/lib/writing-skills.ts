@@ -105,6 +105,13 @@ export function getWritingSkillCommand(value: string, caret = value.length) {
   return { start: before.lastIndexOf('/'), end: caret, query: match[1].trim() };
 }
 
+// 没有清单时，用所有文本路径共同的第一层目录作为技能目录；文件直接位于根部时不设前缀。
+function sharedSkillPrefix(paths: string[]) {
+  const first = paths[0]?.split('/')[0];
+  if (!first || !paths.every((path) => path.includes('/') && path.split('/')[0] === first)) return '';
+  return first + '/';
+}
+
 function assertSafePath(path: string) {
   if (!path || path.length > 200 || /[\u0000-\u001f\\:]/.test(path) || path.startsWith('/') || path.split('/').some((part) => part === '..' || part === '.')) {
     throw new Error('技能包包含不安全或过长的文件路径');
@@ -195,12 +202,15 @@ export async function importWritingSkillZip(file: Blob): Promise<WritingSkill> {
     position = next;
   }
   if (position !== directoryOffset + directorySize) throw new Error('技能 ZIP 文件目录不完整');
+  // 清单允许位于任意层级，多份时取层级最浅的一份；没有清单的技能包按纯文本规则集导入，
+  // 例如只带 references/ 的技能包，不再因为缺少 SKILL.md 被拒绝。
   const manifests = entries.filter(({ path }) => /(^|\/)SKILL\.md$/i.test(path));
-  if (manifests.length !== 1) throw new Error('技能包需要包含且只能包含一个 SKILL.md');
-  const manifest = manifests[0];
-  const prefix = manifest.path.slice(0, -'SKILL.md'.length);
-  if (prefix.split('/').filter(Boolean).length > 1) throw new Error('请把 SKILL.md 放在 ZIP 根目录或第一层技能目录');
-  const accepted = entries.filter(({ path }) => path === manifest.path || (path.startsWith(prefix + 'references/') && /\.(?:md|txt|json)$/i.test(path)));
+  if (manifests.length > 1) throw new Error('技能包包含多个 SKILL.md，请一次只导入一个技能');
+  const manifest = manifests.length ? manifests.reduce((left, right) => (left.path.split('/').length <= right.path.split('/').length ? left : right)) : undefined;
+  const textEntries = entries.filter(({ path }) => /\.(?:md|txt|json)$/i.test(path));
+  const prefix = manifest ? manifest.path.slice(0, -'SKILL.md'.length) : sharedSkillPrefix(textEntries.map(({ path }) => path));
+  const accepted = manifest ? entries.filter(({ path }) => path === manifest.path || (path.startsWith(prefix + 'references/') && /\.(?:md|txt|json)$/i.test(path))) : textEntries;
+  if (!accepted.length) throw new Error('技能包没有可导入的文本内容');
   if (accepted.length > 21) throw new Error('每个技能最多导入 20 份参考资料');
   const texts = new Map<string, string>();
   for (const entry of accepted) {
@@ -215,27 +225,46 @@ export async function importWritingSkillZip(file: Blob): Promise<WritingSkill> {
     if (text.includes('\u0000')) throw new Error('技能包只能导入普通文本');
     texts.set(entry.path, text);
   }
-  let instructions = texts.get(manifest.path)!.trim();
+  let instructions: string;
+  let references: WritingSkillReference[];
   let title = '';
   let description = '';
-  if (/^---\r?\n/.test(instructions)) {
-    const frontmatter = instructions.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-    if (!frontmatter) throw new Error('SKILL.md 的前置元数据缺少结束分隔线');
-    const field = (name: string) => {
-      const found = frontmatter[1].match(new RegExp('^' + name + ':[ \\t]*([^\\r\\n]*)', 'mi'))?.[1]?.trim() || '';
-      if (/^[|>]/.test(found)) throw new Error('技能 name 和 description 请使用单行文本');
-      return found.replace(/^(["'])([\s\S]*)\1$/, '$2');
-    };
-    title = field('name');
-    description = field('description');
-    instructions = instructions.slice(frontmatter[0].length).trim();
+  if (manifest) {
+    instructions = texts.get(manifest.path)!.trim();
+    references = accepted.filter(({ path }) => path !== manifest.path).map(({ path }) => ({ path: path.slice(prefix.length), content: texts.get(path)! }));
+    if (/^---\r?\n/.test(instructions)) {
+      const frontmatter = instructions.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+      if (!frontmatter) throw new Error('SKILL.md 的前置元数据缺少结束分隔线');
+      const field = (name: string) => {
+        const found = frontmatter[1].match(new RegExp('^' + name + ':[ \\t]*([^\\r\\n]*)', 'mi'))?.[1]?.trim() || '';
+        if (/^[|>]/.test(found)) throw new Error('技能 name 和 description 请使用单行文本');
+        return found.replace(/^(["'])([\s\S]*)\1$/, '$2');
+      };
+      title = field('name');
+      description = field('description');
+      instructions = instructions.slice(frontmatter[0].length).trim();
+    }
+    title ||= instructions.match(/^#\s+(.+)$/m)?.[1]?.trim() || '导入的写作技能';
+  } else {
+    // 按路径顺序把文本装填为核心规则，装不下的文本原样保留为按需加载的参考资料，同一内容不会重复占用预算。
+    const ordered = [...accepted].sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+    const core: string[] = [];
+    const rest: WritingSkillReference[] = [];
+    let used = 0;
+    for (const entry of ordered) {
+      const text = texts.get(entry.path)!.trim();
+      if (!text) continue;
+      const need = text.length + (core.length ? 2 : 0);
+      if (!core.length && need > MAX_WRITING_SKILL_INSTRUCTIONS) { core.push(text.slice(0, MAX_WRITING_SKILL_INSTRUCTIONS)); used = MAX_WRITING_SKILL_INSTRUCTIONS; continue; }
+      if (used + need > MAX_WRITING_SKILL_INSTRUCTIONS) { rest.push({ path: entry.path.slice(prefix.length), content: texts.get(entry.path)! }); continue; }
+      core.push(text); used += need;
+    }
+    instructions = core.join('\n\n');
+    references = rest;
+    title = prefix.split('/').filter(Boolean).pop() || '导入的写作技能';
   }
-  title ||= instructions.match(/^#\s+(.+)$/m)?.[1]?.trim() || '导入的写作技能';
   if (title.length > 100 || !instructions || instructions.length > MAX_WRITING_SKILL_INSTRUCTIONS) throw new Error('技能名称最多 100 字符，核心规则应为 1～12000 字符');
   description ||= instructions.replace(/^#+\s*/gm, '').replace(/\s+/g, ' ').slice(0, 160);
   if (description.length > 1000) throw new Error('技能简介最多 1000 字符');
-  return {
-    id: crypto.randomUUID(), title, description, enabled: true, instructions,
-    references: accepted.filter(({ path }) => path !== manifest.path).map(({ path }) => ({ path: path.slice(prefix.length), content: texts.get(path)! })),
-  };
+  return { id: crypto.randomUUID(), title, description, enabled: true, instructions, references };
 }

@@ -807,7 +807,7 @@ function ExpandableKnowledgeBody({ body }: { body: string }) {
   const [expanded, setExpanded] = useState(false);
   const canExpand = body.trim().length > 120;
 
-  return <div className={`knowledge-body ${expanded ? 'expanded' : ''}`}>
+  return <div className={`knowledge-body${canExpand ? ' collapsible' : ''}${expanded ? ' expanded' : ''}`}>
     <div className="knowledge-copy"><p>{body || '尚未填写详细内容。'}</p></div>
     {canExpand && <button
       type="button"
@@ -963,7 +963,7 @@ function Panel({ view, data, setData, setToast, modelConnection, setModelConnect
   if (view === 'knowledge') return withDialog(<div className="content-page"><div className="content-toolbar"><p>{data.knowledge.length} 条设定 · 可新增、编辑和删除</p><button className="primary" onClick={addKnowledge}>＋ 添加知识</button></div><div className="knowledge-grid">{data.knowledge.map((item, i) => <article className="knowledge-card" key={i}><div><span>{item.type}</span><button onClick={() => editKnowledge(item, i)}>编辑</button></div><h3>{item.title}</h3><ExpandableKnowledgeBody body={item.body} /><footer>{item.tags.map((tag) => <i key={tag}>#{tag}</i>)}</footer><div className="card-actions"><button onClick={() => editKnowledge(item, i)}>编辑</button><button className="danger" onClick={() => remove('knowledge', i, item.title)}>删除</button></div></article>)}</div></div>);
   if (view === 'skills') return withDialog(<div className="content-page">
     <div className="content-toolbar"><p>{data.skills.length} 个 Skills · 启用后，在写作台输入 / 选择本次使用的技能</p><div className="skill-import-actions"><label className="file-button">{importingSkill ? '正在导入…' : '导入 Skill ZIP'}<input aria-label="导入 Skill ZIP" type="file" accept=".zip,application/zip" disabled={importingSkill} onChange={(event) => { const file = event.currentTarget.files?.[0] || null; event.currentTarget.value = ''; void importSkillPackage(file); }} /></label><button className="primary" onClick={addSkill}>＋ 创建 Skill</button></div></div>
-    <p className="skill-import-help">压缩包包含 SKILL.md，可附带 references/ 下的文本资料。核心规则完整发送，参考资料只按本次意图加载相关片段；每次最多选 3 个技能。</p>
+    <p className="skill-import-help">压缩包可包含 SKILL.md，也可以只放 Markdown／文本规则（含 references/ 下的资料）。核心规则完整发送，参考资料只按本次意图加载相关片段；每次最多选 3 个技能。</p>
     <div className="skills-list">{data.skills.map((item, index) => <article key={getWritingSkillId(item, index)}><div className="skill-icon">{item.title.slice(0, 1)}</div><button className="skill-edit" onClick={() => editSkill(item, index)}><h3>{item.title}</h3><p>{item.description || item.instructions?.slice(0, 120)}</p><small>{(item.instructions || item.description).length.toLocaleString()} 字符核心规则{item.references?.length ? ` · ${item.references.length} 份参考资料` : ''}</small></button><label className="ai-toggle"><input aria-label={`启用技能 ${item.title}`} type="checkbox" checked={item.enabled} onChange={(e) => setData((d) => ({ ...d, skills: d.skills.map((s, i) => i === index ? { ...s, enabled: e.target.checked } : s) }))} /><span /></label><button className="danger compact" onClick={() => remove('skills', index, item.title)}>删除</button></article>)}</div>
   </div>);
   if (view === 'timeline') {
